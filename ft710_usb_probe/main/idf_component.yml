@@ -1,0 +1,4 @@
+dependencies:
+  usb_host_cp210x_vcp: "^2"
+  usb_host_vcp: "^1"
+  idf: ">=5.5.0"

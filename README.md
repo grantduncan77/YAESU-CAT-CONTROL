@@ -1,39 +1,190 @@
-# CAT CONTROL
+# FT-710 CAT Control
 
-#### 介绍
-{**以下是 Gitee 平台说明，您可以替换此简介**
-Gitee 是 OSCHINA 推出的基于 Git 的代码托管平台（同时支持 SVN）。专为开发者提供稳定、高效、安全的云端软件开发协作平台
-无论是个人、团队、或是企业，都能够用 Gitee 实现代码托管、项目管理、协作开发。企业项目请看 [https://gitee.com/enterprises](https://gitee.com/enterprises)}
+YAESU FT-710 external touch controller based on the Waveshare ESP32-P4-WIFI6-LCD-TOUCH-7B.
 
-#### 软件架构
-软件架构说明
+This repository contains the current ESP-IDF/LVGL firmware and the hardware probe projects created while validating the CAT communication path.
 
+## Goal
 
-#### 安装教程
+The project builds a 7-inch landscape touch panel for controlling common FT-710 CAT functions:
 
-1.  xxxx
-2.  xxxx
-3.  xxxx
+- VFO-A / VFO-B frequency display
+- Direct frequency input
+- VFO-A / VFO-B input target selection
+- A/B working VFO switch
+- Mode selection
+- Band default-frequency write
+- RF Power control
+- DNR on/off and level control
+- CAT / BT / WiFi / RX status bar
+- WiFi setup page
+- Network time display with local / UTC toggle
 
-#### 使用说明
+The first version intentionally does not implement PTT or transmit control.
 
-1.  xxxx
-2.  xxxx
-3.  xxxx
+## Hardware
 
-#### 参与贡献
+- Board: Waveshare ESP32-P4-WIFI6-LCD-TOUCH-7B
+- Display: 7-inch 1024 x 600 MIPI-DSI LCD
+- Touch: GT911 capacitive touch
+- MCU: ESP32-P4
+- Wireless coprocessor: onboard ESP32-C6
+- Current CAT link: ESP32-P4 USB Host -> external CH9102 USB-TTL -> FT-710 CAT-3 TTL UART
 
-1.  Fork 本仓库
-2.  新建 Feat_xxx 分支
-3.  提交代码
-4.  新建 Pull Request
+The FT-710 rear USB direct CP2105 route was tested, but ESP-IDF v5.5.5 currently cannot enumerate the FT-710 downstream CP2105 through the radio's USB hub because the required Hub TT path is not supported for this use case. The first working route is therefore the external CH9102 USB-TTL adapter connected to the FT-710 CAT-3 port.
 
+## Software Baseline
 
-#### 特技
+- ESP-IDF: v5.5.5
+- Target: `esp32p4`
+- UI: LVGL 9
+- Main board serial port used during development: `COM4`
+- Helper script: `idf-v5.5.5.ps1`
 
-1.  使用 Readme\_XXX.md 来支持不同的语言，例如 Readme\_en.md, Readme\_zh.md
-2.  Gitee 官方博客 [blog.gitee.com](https://blog.gitee.com)
-3.  你可以 [https://gitee.com/explore](https://gitee.com/explore) 这个地址来了解 Gitee 上的优秀开源项目
-4.  [GVP](https://gitee.com/gvp) 全称是 Gitee 最有价值开源项目，是综合评定出的优秀开源项目
-5.  Gitee 官方提供的使用手册 [https://gitee.com/help](https://gitee.com/help)
-6.  Gitee 封面人物是一档用来展示 Gitee 会员风采的栏目 [https://gitee.com/gitee-stars/](https://gitee.com/gitee-stars/)
+Activate the local ESP-IDF environment:
+
+```powershell
+. "D:\CAT CONTROL\idf-v5.5.5.ps1"
+```
+
+## Repository Layout
+
+- `ft710_controller/`  
+  Current main firmware. Includes LVGL touch UI, CH9102 USB-TTL CAT transport, command queue, VFO/mode/power/DNR controls, WiFi setup page, soft keyboard, and time display.
+
+- `ft710_ch9102_usb_probe/`  
+  ESP32-P4 USB Host probe for the external CH9102 USB-TTL to FT-710 CAT-3 path.
+
+- `ft710_usb_probe/`  
+  FT-710 rear USB direct CP2105 probe. This documents the failed direct USB route and the Hub/TT limitation.
+
+- `ft710_ji1fgx_probe/`  
+  JI1FGX Yaesu CP2105 ESP32-S3 Hub/CP2105 experiment. This includes a local copy of the modified `espressif__usb` component used for the test.
+
+- `ft710_uart_probe/`  
+  Direct UART CAT-3 probe.
+
+## Build And Flash
+
+Build the main firmware:
+
+```powershell
+. "D:\CAT CONTROL\idf-v5.5.5.ps1"
+cd "D:\CAT CONTROL\ft710_controller"
+idf.py build
+```
+
+Flash to the ESP32-P4 board:
+
+```powershell
+idf.py -p COM4 flash
+```
+
+Optional monitor:
+
+```powershell
+idf.py -p COM4 monitor
+```
+
+`build/` and normal ESP-IDF `managed_components/` directories are intentionally ignored. Dependencies are restored by ESP-IDF from `idf_component.yml` and `dependencies.lock`.
+
+## Verified Results
+
+Development and hardware tests have confirmed:
+
+- ESP32-P4 rev v1.3 boots with ESP-IDF v5.5.5.
+- PSRAM, MIPI-DSI display, EK79007 LCD panel, GT911 touch, and LVGL task initialize correctly.
+- FT-710 CAT over a Windows Enhanced COM port works as a baseline.
+- FT-710 USB Audio input can be received on Windows.
+- ESP32-P4 can open the external CH9102 USB-TTL adapter as `VID:PID 1A86:55D4`.
+- CH9102 + FT-710 CAT-3 works at `38400 8N1`.
+- CAT reads confirmed: `ID;`, `FA;`, `FB;`, `MD0;`, `MD1;`.
+- CAT writes confirmed: VFO-A/VFO-B frequency, VFO-A/VFO-B mode, DNR on, DNR level.
+- Dual VFO frequency polling around 100 ms is usable.
+- Main control UI runs on the 1024 x 600 touch screen.
+- RF Power and DNR now use immediate local UI update plus CAT write and later readback correction.
+- WiFi setup page starts ESP-Hosted WiFi, scans 2.4 GHz APs, and presents a scrollable AP list.
+- Soft keyboard control keys were fixed: `CLEAR`, `BACK`, and `SPACE` now behave correctly.
+
+## WiFi Notes
+
+ESP32-P4 does not include a WiFi radio. On this board, WiFi is provided by the onboard ESP32-C6 through ESP-Hosted / `esp_wifi_remote`.
+
+Current application mode:
+
+- `WIFI_MODE_STA`
+- Connects to a 2.4 GHz router/AP
+- Does not implement AP mode
+- Does not implement WiFi host behavior
+
+After WiFi and SNTP are available, the status bar can display time. Touching the time area toggles local time and UTC time.
+
+## UI Design Notes
+
+The UI follows a dark radio-console style:
+
+- landscape 1024 x 600 layout
+- cyan highlight color
+- thin bordered panels
+- large frequency readouts
+- large touch targets
+- persistent top status bar
+
+The main screen contains:
+
+- status bar
+- dual VFO frequency panel
+- direct frequency keypad
+- RF Power panel
+- DNR panel
+- Mode panel
+- Band panel
+
+The WiFi page contains:
+
+- left scrollable AP scan list
+- right connection status: SSID, IP, gateway, DNS, status
+- right config inputs: SSID, password, connect, disconnect
+- separate soft keyboard page for text entry
+
+## Safety Boundary
+
+The first version is deliberately conservative:
+
+- no PTT
+- no transmit automation
+- no automatic band/mode coupling in the UI
+- CAT write actions should be corrected by radio readback
+
+## Known Limitations
+
+- `ft710_controller/components/app_controller/app_controller.c` currently contains UI, CAT, WiFi, time, and state logic together. It should be split into smaller modules.
+- CH9102 hotplug and reconnect handling needs more work.
+- WiFi connection failure handling, saved credential UX, and reconnect flow need more polish.
+- AP scan cache currently stores a limited number of AP entries.
+- FT-710 rear USB direct CP2105 remains blocked by the Hub/TT path in the tested ESP-IDF stack.
+- Band buttons currently write project-defined default frequencies, not FT-710 Band Stack entries.
+- Long-duration stability and RF-environment testing still need to be completed.
+
+## Suggested Next Steps
+
+Planned refactor:
+
+- `cat_transport_ch9102`
+- `ft710_cat`
+- `radio_state`
+- `ui_main`
+- `ui_wifi`
+- `ui_keyboard`
+- `wifi_manager`
+- `time_service`
+- `settings`
+- `diagnostics`
+
+Test priorities:
+
+- CH9102 reconnect and hotplug
+- WiFi connect/disconnect/reconnect
+- 30-minute and longer stability tests
+- pending/confirmed CAT command UI state
+- real operating-position touch usability

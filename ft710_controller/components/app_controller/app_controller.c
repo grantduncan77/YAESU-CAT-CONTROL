@@ -1,0 +1,1474 @@
+#include "app_controller.h"
+
+#include <assert.h>
+#include <ctype.h>
+#include <stdbool.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+
+#include "bsp/display.h"
+#include "bsp/esp-bsp.h"
+#include "esp_check.h"
+#include "esp_err.h"
+#include "esp_event.h"
+#include "esp_log.h"
+#include "esp_netif.h"
+#include "esp_sntp.h"
+#include "esp_timer.h"
+#include "esp_wifi.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/event_groups.h"
+#include "freertos/queue.h"
+#include "freertos/task.h"
+#include "lvgl.h"
+#include "nvs.h"
+#include "nvs_flash.h"
+#include "radio_state.h"
+#include "usb/cdc_acm_host.h"
+#include "usb/cdc_acm_host_ops.h"
+#include "usb/usb_host.h"
+#include "usb/usb_types_cdc.h"
+
+static const char *TAG = "ft710_controller";
+
+typedef enum {
+    CMD_SET_FREQ,
+    CMD_SET_POWER,
+    CMD_ADJUST_POWER,
+    CMD_SET_POWER_STEP,
+    CMD_SET_DNR_LEVEL,
+    CMD_ADJUST_DNR,
+    CMD_SET_MODE,
+    CMD_SELECT_MAIN_VFO,
+    CMD_SET_BAND_FREQ,
+} app_cmd_type_t;
+
+typedef struct {
+    app_cmd_type_t type;
+    char vfo;
+    uint32_t hz;
+    uint8_t value;
+    int8_t delta;
+    ft710_mode_t mode;
+} app_cmd_t;
+
+typedef struct {
+    uint8_t value;
+} rx_byte_t;
+
+typedef enum {
+    SCREEN_MAIN,
+    SCREEN_WIFI,
+    SCREEN_WIFI_KEYBOARD,
+} app_screen_t;
+
+typedef enum {
+    TIME_LOCAL,
+    TIME_UTC,
+} time_view_t;
+
+typedef enum {
+    WIFI_STATE_OFF,
+    WIFI_STATE_READY,
+    WIFI_STATE_SCANNING,
+    WIFI_STATE_CONNECTING,
+    WIFI_STATE_ONLINE,
+    WIFI_STATE_FAILED,
+} wifi_state_t;
+
+typedef enum {
+    WIFI_EDIT_SSID,
+    WIFI_EDIT_PASSWORD,
+} wifi_edit_field_t;
+
+typedef enum {
+    WIFI_CMD_SCAN,
+    WIFI_CMD_CONNECT,
+    WIFI_CMD_DISCONNECT,
+} wifi_cmd_type_t;
+
+typedef struct {
+    wifi_cmd_type_t type;
+} wifi_cmd_t;
+
+typedef struct {
+    char ssid[33];
+    int8_t rssi;
+    uint8_t channel;
+    wifi_auth_mode_t authmode;
+} wifi_ap_item_t;
+
+#define WIFI_AP_MAX 16
+
+static QueueHandle_t s_rx_queue;
+static QueueHandle_t s_cmd_queue;
+static QueueHandle_t s_wifi_cmd_queue;
+static EventGroupHandle_t s_wifi_event_group;
+static radio_state_t s_state;
+static char s_input[18];
+static char s_input_target_vfo = 'A';
+static uint8_t s_power_step = 2;
+static app_screen_t s_screen = SCREEN_MAIN;
+static time_view_t s_time_view = TIME_LOCAL;
+static wifi_state_t s_wifi_state = WIFI_STATE_OFF;
+static esp_netif_t *s_wifi_netif;
+static bool s_sntp_started;
+static bool s_wifi_manual_disconnect;
+static bool s_kb_upper = true;
+static wifi_edit_field_t s_wifi_edit_field = WIFI_EDIT_PASSWORD;
+static int s_wifi_retry;
+static char s_wifi_ssid[33] = "";
+static char s_wifi_edit_value[65] = "hamshack-710";
+static char s_wifi_ip[16] = "--.--.--.--";
+static char s_wifi_gateway[16] = "--.--.--.--";
+static char s_wifi_dns[16] = "--.--.--.--";
+static wifi_ap_item_t s_wifi_aps[WIFI_AP_MAX];
+static char s_wifi_ap_ids[WIFI_AP_MAX][6];
+static uint16_t s_wifi_ap_count;
+
+static lv_obj_t *s_cat_status;
+static lv_obj_t *s_bt_status;
+static lv_obj_t *s_wifi_status;
+static lv_obj_t *s_rx_status;
+static lv_obj_t *s_time_label;
+static lv_obj_t *s_wifi_conn_ssid_label;
+static lv_obj_t *s_wifi_ip_label;
+static lv_obj_t *s_wifi_gateway_label;
+static lv_obj_t *s_wifi_dns_label;
+static lv_obj_t *s_wifi_page_status_label;
+static lv_obj_t *s_freq_a;
+static lv_obj_t *s_freq_b;
+static lv_obj_t *s_vfo_a_tag;
+static lv_obj_t *s_vfo_b_tag;
+static lv_obj_t *s_vfo_a_meta;
+static lv_obj_t *s_vfo_b_meta;
+static lv_obj_t *s_input_hint;
+static lv_obj_t *s_power_label;
+static lv_obj_t *s_power_step_btns[3];
+static lv_obj_t *s_dnr_label;
+static lv_obj_t *s_dnr_cmd_label;
+static lv_obj_t *s_mode_btns[5];
+static lv_obj_t *s_band_btns[6];
+
+static const lv_color_t C_BG = LV_COLOR_MAKE(0x04, 0x09, 0x0B);
+static const lv_color_t C_PANEL = LV_COLOR_MAKE(0x0B, 0x17, 0x1B);
+static const lv_color_t C_BTN = LV_COLOR_MAKE(0x1A, 0x2B, 0x31);
+static const lv_color_t C_BTN_ACTIVE = LV_COLOR_MAKE(0x0E, 0x3D, 0x45);
+static const lv_color_t C_BORDER = LV_COLOR_MAKE(0x31, 0x51, 0x5B);
+static const lv_color_t C_TEXT = LV_COLOR_MAKE(0xD9, 0xF2, 0xF3);
+static const lv_color_t C_MUTED = LV_COLOR_MAKE(0x82, 0xA5, 0xAE);
+static const lv_color_t C_CYAN = LV_COLOR_MAKE(0x35, 0xE8, 0xF2);
+
+static void update_ui(void);
+static void update_ui_locked(void);
+static void create_ui(void);
+static void create_wifi_ui(void);
+static void create_wifi_keyboard_ui(void);
+
+static bool rx_cb(const uint8_t *data, size_t data_len, void *arg)
+{
+    (void)arg;
+    for (size_t i = 0; i < data_len; ++i) {
+        const rx_byte_t b = {.value = data[i]};
+        xQueueSend(s_rx_queue, &b, 0);
+    }
+    return true;
+}
+
+static void event_cb(const cdc_acm_host_dev_event_data_t *event, void *user_ctx)
+{
+    (void)user_ctx;
+    if (event->type == CDC_ACM_HOST_DEVICE_DISCONNECTED) {
+        s_state.online = false;
+        ESP_LOGW(TAG, "CH9102 disconnected");
+    } else if (event->type == CDC_ACM_HOST_ERROR) {
+        ESP_LOGE(TAG, "CDC error: %d", event->data.error);
+    }
+}
+
+static void usb_lib_task(void *arg)
+{
+    (void)arg;
+    while (true) {
+        uint32_t event_flags = 0;
+        usb_host_lib_handle_events(portMAX_DELAY, &event_flags);
+        if (event_flags & USB_HOST_LIB_EVENT_FLAGS_NO_CLIENTS) {
+            usb_host_device_free_all();
+        }
+    }
+}
+
+static void flush_rx(void)
+{
+    rx_byte_t b = {};
+    while (xQueueReceive(s_rx_queue, &b, 0) == pdTRUE) {
+    }
+}
+
+static esp_err_t read_frame(char *out, size_t out_size, TickType_t timeout)
+{
+    ESP_RETURN_ON_FALSE(out && out_size > 0, ESP_ERR_INVALID_ARG, TAG, "bad read buffer");
+    size_t pos = 0;
+    const TickType_t deadline = xTaskGetTickCount() + timeout;
+    while (xTaskGetTickCount() < deadline) {
+        rx_byte_t b = {};
+        const TickType_t now = xTaskGetTickCount();
+        const TickType_t wait = (deadline > now) ? (deadline - now) : 0;
+        if (xQueueReceive(s_rx_queue, &b, wait) == pdTRUE) {
+            if (pos + 1 < out_size) {
+                out[pos++] = (char)b.value;
+            }
+            if (b.value == ';') {
+                out[pos] = '\0';
+                return ESP_OK;
+            }
+        }
+    }
+    out[pos] = '\0';
+    return ESP_ERR_TIMEOUT;
+}
+
+static esp_err_t cat_query(cdc_acm_dev_hdl_t dev, const char *cmd, char *resp, size_t resp_size, int64_t *elapsed_ms)
+{
+    const int64_t start_us = esp_timer_get_time();
+    flush_rx();
+    ESP_RETURN_ON_ERROR(cdc_acm_host_data_tx_blocking(dev, (const uint8_t *)cmd, strlen(cmd), 1000), TAG, "tx failed");
+    const esp_err_t err = read_frame(resp, resp_size, pdMS_TO_TICKS(500));
+    if (elapsed_ms) {
+        *elapsed_ms = (esp_timer_get_time() - start_us) / 1000;
+    }
+    return err;
+}
+
+static esp_err_t cat_send(cdc_acm_dev_hdl_t dev, const char *cmd, int64_t *elapsed_ms)
+{
+    const int64_t start_us = esp_timer_get_time();
+    flush_rx();
+    const esp_err_t err = cdc_acm_host_data_tx_blocking(dev, (const uint8_t *)cmd, strlen(cmd), 1000);
+    if (elapsed_ms) {
+        *elapsed_ms = (esp_timer_get_time() - start_us) / 1000;
+    }
+    return err;
+}
+
+static bool parse_fixed_uint(const char *s, int start, int end, uint32_t *out)
+{
+    uint32_t value = 0;
+    for (int i = start; i < end; ++i) {
+        if (!isdigit((unsigned char)s[i])) {
+            return false;
+        }
+        value = value * 10 + (uint32_t)(s[i] - '0');
+    }
+    *out = value;
+    return true;
+}
+
+static bool parse_vfo_hz(const char *resp, const char *prefix, uint32_t *hz)
+{
+    return resp && prefix && strlen(resp) >= 12 && strncmp(resp, prefix, 2) == 0 && resp[11] == ';' &&
+           parse_fixed_uint(resp, 2, 11, hz);
+}
+
+static bool parse_u8_3(const char *resp, const char *prefix, uint8_t *value)
+{
+    uint32_t parsed = 0;
+    if (!resp || !prefix || strlen(resp) < 6 || strncmp(resp, prefix, 2) != 0 || !parse_fixed_uint(resp, 2, 5, &parsed)) {
+        return false;
+    }
+    *value = (uint8_t)parsed;
+    return true;
+}
+
+static bool parse_mode(const char *resp, const char *prefix, ft710_mode_t *mode)
+{
+    if (!resp || !prefix || strlen(resp) < 5 || strncmp(resp, prefix, 3) != 0 || resp[4] != ';') {
+        return false;
+    }
+    const char c = (char)toupper((unsigned char)resp[3]);
+    uint8_t code = 0;
+    if (c >= '0' && c <= '9') {
+        code = (uint8_t)(c - '0');
+    } else if (c >= 'A' && c <= 'F') {
+        code = (uint8_t)(10 + c - 'A');
+    } else {
+        return false;
+    }
+    *mode = radio_state_mode_from_code(code);
+    return true;
+}
+
+static bool parse_bool_4(const char *resp, const char *prefix, bool *value)
+{
+    uint32_t parsed = 0;
+    if (!resp || !prefix || strlen(resp) < 5 || strncmp(resp, prefix, 3) != 0 || resp[4] != ';' ||
+        !parse_fixed_uint(resp, 3, 4, &parsed)) {
+        return false;
+    }
+    *value = parsed != 0;
+    return true;
+}
+
+static bool parse_input_hz(uint32_t *hz)
+{
+    if (!s_input[0]) {
+        return false;
+    }
+    uint32_t mhz = 0;
+    uint32_t frac = 0;
+    int frac_digits = 0;
+    bool saw_dot = false;
+    for (size_t i = 0; s_input[i]; ++i) {
+        const char c = s_input[i];
+        if (c == '.') {
+            if (saw_dot) {
+                return false;
+            }
+            saw_dot = true;
+            continue;
+        }
+        if (!isdigit((unsigned char)c)) {
+            return false;
+        }
+        if (saw_dot) {
+            if (frac_digits < 6) {
+                frac = frac * 10 + (uint32_t)(c - '0');
+                frac_digits++;
+            }
+        } else {
+            mhz = mhz * 10 + (uint32_t)(c - '0');
+        }
+    }
+    while (frac_digits < 6) {
+        frac *= 10;
+        frac_digits++;
+    }
+    const uint32_t value = mhz * 1000000U + frac;
+    if (value == 0 || value > 999999999U) {
+        return false;
+    }
+    *hz = value;
+    return true;
+}
+
+static void fmt_freq(uint32_t hz, char *out, size_t out_size)
+{
+    snprintf(out, out_size, "%02lu.%03lu.%03lu", (unsigned long)(hz / 1000000U),
+             (unsigned long)((hz / 1000U) % 1000U), (unsigned long)(hz % 1000U));
+}
+
+static const char *wifi_state_text(void)
+{
+    switch (s_wifi_state) {
+    case WIFI_STATE_READY:
+        return "WIFI READY";
+    case WIFI_STATE_SCANNING:
+        return "WIFI SCAN";
+    case WIFI_STATE_CONNECTING:
+        return "WIFI JOIN";
+    case WIFI_STATE_ONLINE:
+        return "WIFI ON";
+    case WIFI_STATE_FAILED:
+        return "WIFI FAIL";
+    case WIFI_STATE_OFF:
+    default:
+        return "WIFI OFF";
+    }
+}
+
+static const char *wifi_page_status_text(void)
+{
+    switch (s_wifi_state) {
+    case WIFI_STATE_SCANNING:
+        return "SCANNING";
+    case WIFI_STATE_CONNECTING:
+        return "JOINING";
+    case WIFI_STATE_ONLINE:
+        return "ONLINE";
+    case WIFI_STATE_FAILED:
+        return "FAILED";
+    case WIFI_STATE_READY:
+        return "READY";
+    case WIFI_STATE_OFF:
+    default:
+        return "OFFLINE";
+    }
+}
+
+static const char *wifi_auth_text(wifi_auth_mode_t auth)
+{
+    switch (auth) {
+    case WIFI_AUTH_OPEN:
+        return "OPEN";
+    case WIFI_AUTH_WEP:
+        return "WEP";
+    case WIFI_AUTH_WPA_PSK:
+        return "WPA";
+    case WIFI_AUTH_WPA2_PSK:
+        return "WPA2";
+    case WIFI_AUTH_WPA_WPA2_PSK:
+        return "WPA/WPA2";
+    case WIFI_AUTH_WPA2_ENTERPRISE:
+        return "WPA2-ENT";
+    case WIFI_AUTH_WPA3_PSK:
+        return "WPA3";
+    case WIFI_AUTH_WPA2_WPA3_PSK:
+        return "WPA2/WPA3";
+    default:
+        return "--";
+    }
+}
+
+static void send_wifi_cmd(wifi_cmd_type_t type)
+{
+    if (!s_wifi_cmd_queue) {
+        return;
+    }
+    const wifi_cmd_t cmd = {.type = type};
+    xQueueSend(s_wifi_cmd_queue, &cmd, 0);
+}
+
+static char *wifi_edit_target(size_t *size)
+{
+    if (s_wifi_edit_field == WIFI_EDIT_SSID) {
+        if (size) {
+            *size = sizeof(s_wifi_ssid);
+        }
+        return s_wifi_ssid;
+    }
+    if (size) {
+        *size = sizeof(s_wifi_edit_value);
+    }
+    return s_wifi_edit_value;
+}
+
+static void password_mask(char *out, size_t out_size)
+{
+    size_t len = strlen(s_wifi_edit_value);
+    if (len >= out_size) {
+        len = out_size - 1;
+    }
+    memset(out, '*', len);
+    out[len] = '\0';
+    if (!len) {
+        strlcpy(out, "--", out_size);
+    }
+}
+
+static void clear_wifi_addrs(void)
+{
+    strlcpy(s_wifi_ip, "--.--.--.--", sizeof(s_wifi_ip));
+    strlcpy(s_wifi_gateway, "--.--.--.--", sizeof(s_wifi_gateway));
+    strlcpy(s_wifi_dns, "--.--.--.--", sizeof(s_wifi_dns));
+}
+
+static lv_obj_t *label(lv_obj_t *parent, const char *text, int x, int y, const lv_font_t *font, lv_color_t color)
+{
+    lv_obj_t *obj = lv_label_create(parent);
+    lv_label_set_text(obj, text);
+    lv_obj_set_pos(obj, x, y);
+    lv_obj_set_style_text_font(obj, font, LV_PART_MAIN);
+    lv_obj_set_style_text_color(obj, color, LV_PART_MAIN);
+    lv_obj_set_style_text_letter_space(obj, 1, LV_PART_MAIN);
+    return obj;
+}
+
+static lv_obj_t *box(lv_obj_t *parent, int x, int y, int w, int h, lv_color_t bg)
+{
+    lv_obj_t *obj = lv_obj_create(parent);
+    lv_obj_set_pos(obj, x, y);
+    lv_obj_set_size(obj, w, h);
+    lv_obj_set_style_bg_color(obj, bg, LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(obj, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_border_color(obj, C_BORDER, LV_PART_MAIN);
+    lv_obj_set_style_border_width(obj, 1, LV_PART_MAIN);
+    lv_obj_set_style_radius(obj, 8, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(obj, 0, LV_PART_MAIN);
+    lv_obj_clear_flag(obj, LV_OBJ_FLAG_SCROLLABLE);
+    return obj;
+}
+
+static void set_button_active(lv_obj_t *btn, bool active)
+{
+    lv_obj_set_style_bg_color(btn, active ? C_BTN_ACTIVE : C_BTN, LV_PART_MAIN);
+    lv_obj_set_style_border_color(btn, active ? C_CYAN : C_BORDER, LV_PART_MAIN);
+    lv_obj_t *child = lv_obj_get_child(btn, 0);
+    if (child) {
+        lv_obj_set_style_text_color(child, active ? C_CYAN : C_MUTED, LV_PART_MAIN);
+    }
+}
+
+static void send_cmd(const app_cmd_t *cmd)
+{
+    xQueueSend(s_cmd_queue, cmd, 0);
+}
+
+static void button_event_cb(lv_event_t *e)
+{
+    const char *id = (const char *)lv_event_get_user_data(e);
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED || !id) {
+        return;
+    }
+
+    if (strcmp(id, "TIME_TOGGLE") == 0) {
+        s_time_view = s_time_view == TIME_LOCAL ? TIME_UTC : TIME_LOCAL;
+        update_ui();
+        return;
+    }
+    if (strcmp(id, "NAV_WIFI") == 0) {
+        if (bsp_display_lock(pdMS_TO_TICKS(100))) {
+            create_wifi_ui();
+            bsp_display_unlock();
+        }
+        return;
+    }
+    if (strcmp(id, "BACK_MAIN") == 0) {
+        if (bsp_display_lock(pdMS_TO_TICKS(100))) {
+            create_ui();
+            bsp_display_unlock();
+        }
+        return;
+    }
+    if (strcmp(id, "EDIT_SSID") == 0 || strcmp(id, "EDIT_PASS") == 0 || strcmp(id, "KB_OPEN") == 0) {
+        s_wifi_edit_field = strcmp(id, "EDIT_SSID") == 0 ? WIFI_EDIT_SSID : WIFI_EDIT_PASSWORD;
+        if (bsp_display_lock(pdMS_TO_TICKS(100))) {
+            create_wifi_keyboard_ui();
+            bsp_display_unlock();
+        }
+        return;
+    }
+    if (strcmp(id, "KB_DONE") == 0 || strcmp(id, "KB_CANCEL") == 0) {
+        if (bsp_display_lock(pdMS_TO_TICKS(100))) {
+            create_wifi_ui();
+            bsp_display_unlock();
+        }
+        return;
+    }
+    if (strcmp(id, "WIFI_CONNECT") == 0 || strcmp(id, "WIFI_DISCONNECT") == 0) {
+        send_wifi_cmd(strcmp(id, "WIFI_CONNECT") == 0 ? WIFI_CMD_CONNECT : WIFI_CMD_DISCONNECT);
+        return;
+    }
+    if (strcmp(id, "WIFI_SCAN") == 0) {
+        send_wifi_cmd(WIFI_CMD_SCAN);
+        return;
+    }
+    if (strncmp(id, "AP_", 3) == 0) {
+        const int index = atoi(id + 3);
+        if (index >= 0 && index < s_wifi_ap_count && index < (int)(sizeof(s_wifi_aps) / sizeof(s_wifi_aps[0]))) {
+            strlcpy(s_wifi_ssid, s_wifi_aps[index].ssid, sizeof(s_wifi_ssid));
+            if (bsp_display_lock(pdMS_TO_TICKS(100))) {
+                create_wifi_ui();
+                bsp_display_unlock();
+            }
+        }
+        return;
+    }
+    if (s_screen == SCREEN_WIFI_KEYBOARD) {
+        size_t target_size = 0;
+        char *target = wifi_edit_target(&target_size);
+        const size_t len = strlen(target);
+        if (strcmp(id, "K_SHIFT") == 0) {
+            s_kb_upper = !s_kb_upper;
+        } else if (strcmp(id, "K_SPACE") == 0 && len + 1 < target_size) {
+            target[len] = ' ';
+            target[len + 1] = '\0';
+        } else if (strcmp(id, "K_BS") == 0 && len > 0) {
+            target[len - 1] = '\0';
+        } else if (strcmp(id, "K_CLR") == 0) {
+            target[0] = '\0';
+        } else if (strncmp(id, "K_", 2) == 0 && len + 1 < target_size) {
+            target[len] = id[2];
+            target[len + 1] = '\0';
+        }
+        if (bsp_display_lock(pdMS_TO_TICKS(50))) {
+            create_wifi_keyboard_ui();
+            bsp_display_unlock();
+        }
+        return;
+    }
+    if (s_screen != SCREEN_MAIN) {
+        return;
+    }
+
+    app_cmd_t cmd = {};
+    if (strlen(id) == 1 && (isdigit((unsigned char)id[0]) || id[0] == '.')) {
+        const size_t len = strlen(s_input);
+        if (len + 1 < sizeof(s_input) && !(id[0] == '.' && strchr(s_input, '.'))) {
+            s_input[len] = id[0];
+            s_input[len + 1] = '\0';
+        }
+    } else if (strcmp(id, "BS") == 0) {
+        const size_t len = strlen(s_input);
+        if (len) {
+            s_input[len - 1] = '\0';
+        }
+    } else if (strcmp(id, "CLR") == 0) {
+        s_input[0] = '\0';
+    } else if (strcmp(id, "TARGET_A") == 0) {
+        s_input_target_vfo = 'A';
+    } else if (strcmp(id, "TARGET_B") == 0) {
+        s_input_target_vfo = 'B';
+    } else if (strcmp(id, "SET") == 0) {
+        uint32_t hz = 0;
+        if (parse_input_hz(&hz)) {
+            cmd.type = CMD_SET_FREQ;
+            cmd.vfo = s_input_target_vfo;
+            cmd.hz = hz;
+            send_cmd(&cmd);
+            s_input[0] = '\0';
+        }
+    } else if (strcmp(id, "AB") == 0) {
+        cmd.type = CMD_SELECT_MAIN_VFO;
+        cmd.vfo = s_state.active_vfo == 'A' ? 'B' : 'A';
+        s_state.active_vfo = cmd.vfo;
+        send_cmd(&cmd);
+    } else if (strcmp(id, "P2") == 0 || strcmp(id, "P5") == 0 || strcmp(id, "P10") == 0) {
+        s_power_step = (uint8_t)atoi(id + 1);
+    } else if (strcmp(id, "P-") == 0 || strcmp(id, "P+") == 0) {
+        int p = (int)s_state.power_w + (strcmp(id, "P+") == 0 ? (int)s_power_step : -(int)s_power_step);
+        if (p < 5) p = 5;
+        if (p > 100) p = 100;
+        s_state.power_w = (uint8_t)p;
+        cmd.type = CMD_SET_POWER;
+        cmd.value = (uint8_t)p;
+        send_cmd(&cmd);
+    } else if (strcmp(id, "D-") == 0 || strcmp(id, "D+") == 0) {
+        int level = s_state.dnr_on ? s_state.dnr_level : 0;
+        level += strcmp(id, "D+") == 0 ? 1 : -1;
+        if (level <= 0) {
+            level = 0;
+            s_state.dnr_on = false;
+        } else {
+            if (level > 15) level = 15;
+            s_state.dnr_on = true;
+        }
+        s_state.dnr_level = (uint8_t)level;
+        cmd.type = CMD_SET_DNR_LEVEL;
+        cmd.value = (uint8_t)level;
+        send_cmd(&cmd);
+    } else if (strncmp(id, "M_", 2) == 0) {
+        cmd.type = CMD_SET_MODE;
+        if (strcmp(id, "M_LSB") == 0) cmd.mode = FT710_MODE_LSB;
+        else if (strcmp(id, "M_USB") == 0) cmd.mode = FT710_MODE_USB;
+        else if (strcmp(id, "M_FM") == 0) cmd.mode = FT710_MODE_FM;
+        else if (strcmp(id, "M_AM") == 0) cmd.mode = FT710_MODE_AM;
+        else cmd.mode = FT710_MODE_DATA_U;
+        cmd.vfo = s_state.active_vfo;
+        if (cmd.vfo == 'B') {
+            s_state.mode_b = cmd.mode;
+        } else {
+            s_state.mode_a = cmd.mode;
+        }
+        send_cmd(&cmd);
+    } else if (strncmp(id, "B_", 2) == 0) {
+        cmd.type = CMD_SET_BAND_FREQ;
+        cmd.vfo = s_state.active_vfo;
+        cmd.hz = radio_state_band_default_hz(id + 2);
+        if (cmd.vfo == 'B') {
+            s_state.vfo_b_hz = cmd.hz;
+        } else {
+            s_state.vfo_a_hz = cmd.hz;
+        }
+        send_cmd(&cmd);
+    }
+
+    if (bsp_display_lock(pdMS_TO_TICKS(50))) {
+        char buf[40] = {};
+        snprintf(buf, sizeof(buf), "%c  %s", s_input_target_vfo, s_input[0] ? s_input : "--.---");
+        lv_label_set_text(s_input_hint, buf);
+        update_ui_locked();
+        bsp_display_unlock();
+    }
+}
+
+static lv_obj_t *button(lv_obj_t *parent, const char *text, const char *id, int x, int y, int w, int h, const lv_font_t *font)
+{
+    lv_obj_t *btn = lv_button_create(parent);
+    lv_obj_set_pos(btn, x, y);
+    lv_obj_set_size(btn, w, h);
+    lv_obj_set_style_radius(btn, 7, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(btn, C_BTN, LV_PART_MAIN);
+    lv_obj_set_style_border_color(btn, C_BORDER, LV_PART_MAIN);
+    lv_obj_set_style_border_width(btn, 1, LV_PART_MAIN);
+    lv_obj_set_style_shadow_width(btn, 0, LV_PART_MAIN);
+    lv_obj_add_event_cb(btn, button_event_cb, LV_EVENT_CLICKED, (void *)id);
+
+    lv_obj_t *txt = lv_label_create(btn);
+    lv_label_set_text(txt, text);
+    lv_obj_set_style_text_font(txt, font, LV_PART_MAIN);
+    lv_obj_set_style_text_color(txt, C_TEXT, LV_PART_MAIN);
+    lv_obj_set_style_text_letter_space(txt, 1, LV_PART_MAIN);
+    lv_obj_center(txt);
+    return btn;
+}
+
+static lv_obj_t *pill(lv_obj_t *parent, const char *text, int x, int y, bool active)
+{
+    lv_obj_t *obj = button(parent, text, "noop", x, y, 120, 25, &lv_font_montserrat_14);
+    lv_obj_remove_event_cb(obj, button_event_cb);
+    set_button_active(obj, active);
+    return obj;
+}
+
+static void touch_zone(lv_obj_t *parent, const char *id, int x, int y, int w, int h)
+{
+    lv_obj_t *obj = lv_button_create(parent);
+    lv_obj_set_pos(obj, x, y);
+    lv_obj_set_size(obj, w, h);
+    lv_obj_set_style_bg_opa(obj, LV_OPA_TRANSP, LV_PART_MAIN);
+    lv_obj_set_style_border_width(obj, 0, LV_PART_MAIN);
+    lv_obj_set_style_shadow_width(obj, 0, LV_PART_MAIN);
+    lv_obj_add_event_cb(obj, button_event_cb, LV_EVENT_CLICKED, (void *)id);
+}
+
+static void format_time_text(char *buf, size_t size)
+{
+    const time_t now = time(NULL);
+    if (now < 1700000000) {
+        snprintf(buf, size, "%s --:--:--", s_time_view == TIME_LOCAL ? "LOCAL" : "UTC");
+        return;
+    }
+
+    struct tm tm_info = {};
+    if (s_time_view == TIME_LOCAL) {
+        localtime_r(&now, &tm_info);
+        snprintf(buf, size, "LOCAL %02d:%02d:%02d", tm_info.tm_hour, tm_info.tm_min, tm_info.tm_sec);
+    } else {
+        gmtime_r(&now, &tm_info);
+        snprintf(buf, size, "UTC %02d:%02d:%02d", tm_info.tm_hour, tm_info.tm_min, tm_info.tm_sec);
+    }
+}
+
+static void update_top_bar_locked(void)
+{
+    if (s_time_label) {
+        char buf[32] = {};
+        format_time_text(buf, sizeof(buf));
+        lv_label_set_text(s_time_label, buf);
+    }
+}
+
+static void create_top_bar(lv_obj_t *scr, bool show_back)
+{
+    box(scr, 8, 6, 1008, 36, C_PANEL);
+    label(scr, "FT-710 CONTROL", 24, 15, &lv_font_montserrat_14, C_TEXT);
+    s_time_label = label(scr, "LOCAL --:--:--", 212, 15, &lv_font_montserrat_14, C_TEXT);
+    touch_zone(scr, "TIME_TOGGLE", 198, 6, 180, 36);
+    s_cat_status = lv_obj_get_child(pill(scr, "CAT WAIT", 388, 12, false), 0);
+    s_bt_status = lv_obj_get_child(pill(scr, "BT OFF", 518, 12, false), 0);
+    lv_obj_t *wifi_btn = button(scr, wifi_state_text(), "NAV_WIFI", 648, 12, 120, 25, &lv_font_montserrat_14);
+    s_wifi_status = lv_obj_get_child(wifi_btn, 0);
+    set_button_active(wifi_btn, s_wifi_state == WIFI_STATE_ONLINE || s_wifi_state == WIFI_STATE_CONNECTING ||
+                                    s_wifi_state == WIFI_STATE_SCANNING);
+    s_rx_status = lv_obj_get_child(pill(scr, "RX", 778, 12, true), 0);
+    if (show_back) {
+        button(scr, "BACK", "BACK_MAIN", 908, 12, 92, 25, &lv_font_montserrat_14);
+    } else {
+        label(scr, "MENU", 944, 15, &lv_font_montserrat_14, C_MUTED);
+    }
+}
+
+static void update_ui_locked(void)
+{
+    update_top_bar_locked();
+    if (s_screen != SCREEN_MAIN) {
+        if (s_screen == SCREEN_WIFI && s_wifi_page_status_label) {
+            lv_label_set_text(s_wifi_conn_ssid_label, s_wifi_state == WIFI_STATE_ONLINE ? s_wifi_ssid : "--");
+            lv_label_set_text(s_wifi_ip_label, s_wifi_ip);
+            lv_label_set_text(s_wifi_gateway_label, s_wifi_gateway);
+            lv_label_set_text(s_wifi_dns_label, s_wifi_dns);
+            lv_label_set_text(s_wifi_page_status_label, wifi_page_status_text());
+            lv_obj_set_style_text_color(s_wifi_page_status_label,
+                                        s_wifi_state == WIFI_STATE_ONLINE ? C_CYAN : C_MUTED, LV_PART_MAIN);
+        }
+        return;
+    }
+
+    char buf[48] = {};
+    fmt_freq(s_state.vfo_a_hz, buf, sizeof(buf));
+    lv_label_set_text(s_freq_a, buf);
+    fmt_freq(s_state.vfo_b_hz, buf, sizeof(buf));
+    lv_label_set_text(s_freq_b, buf);
+
+    lv_label_set_text(s_vfo_a_tag, s_state.active_vfo == 'A' ? "VFO-A" : "VFO-A");
+    lv_label_set_text(s_vfo_b_tag, s_state.active_vfo == 'B' ? "VFO-B" : "VFO-B");
+    lv_obj_set_style_text_color(s_vfo_a_tag, s_state.active_vfo == 'A' ? C_CYAN : C_MUTED, LV_PART_MAIN);
+    lv_obj_set_style_text_color(s_vfo_b_tag, s_state.active_vfo == 'B' ? C_CYAN : C_MUTED, LV_PART_MAIN);
+
+    snprintf(buf, sizeof(buf), "%s\n%uW", radio_state_mode_name(s_state.mode_a), s_state.power_w);
+    lv_label_set_text(s_vfo_a_meta, buf);
+    snprintf(buf, sizeof(buf), "%s\n%uW", radio_state_mode_name(s_state.mode_b), s_state.power_w);
+    lv_label_set_text(s_vfo_b_meta, buf);
+
+    snprintf(buf, sizeof(buf), "%uW", s_state.power_w);
+    lv_label_set_text(s_power_label, buf);
+    snprintf(buf, sizeof(buf), "%02u", s_state.dnr_on ? s_state.dnr_level : 0);
+    lv_label_set_text(s_dnr_label, s_state.dnr_on ? buf : "OFF");
+    snprintf(buf, sizeof(buf), "RL%03u", s_state.dnr_level);
+    lv_label_set_text(s_dnr_cmd_label, buf);
+
+    lv_label_set_text(s_cat_status, s_state.online ? "CAT ONLINE" : "CAT WAIT");
+    lv_label_set_text(s_wifi_status, wifi_state_text());
+    set_button_active(lv_obj_get_parent(s_cat_status), s_state.online);
+    set_button_active(lv_obj_get_parent(s_bt_status), false);
+    set_button_active(lv_obj_get_parent(s_wifi_status), s_wifi_state == WIFI_STATE_ONLINE ||
+                                                s_wifi_state == WIFI_STATE_CONNECTING ||
+                                                s_wifi_state == WIFI_STATE_SCANNING);
+    set_button_active(lv_obj_get_parent(s_rx_status), true);
+
+    set_button_active(s_power_step_btns[0], s_power_step == 2);
+    set_button_active(s_power_step_btns[1], s_power_step == 5);
+    set_button_active(s_power_step_btns[2], s_power_step == 10);
+
+    ft710_mode_t active_mode = s_state.active_vfo == 'B' ? s_state.mode_b : s_state.mode_a;
+    const ft710_mode_t modes[5] = {FT710_MODE_LSB, FT710_MODE_USB, FT710_MODE_FM, FT710_MODE_AM, FT710_MODE_DATA_U};
+    for (int i = 0; i < 5; ++i) {
+        set_button_active(s_mode_btns[i], active_mode == modes[i]);
+    }
+
+    const uint32_t active_hz = s_state.active_vfo == 'B' ? s_state.vfo_b_hz : s_state.vfo_a_hz;
+    const uint32_t bands[6] = {3500000, 7074000, 14270000, 21400000, 28400000, 50125000};
+    for (int i = 0; i < 6; ++i) {
+        uint32_t low = bands[i] > 500000 ? bands[i] - 500000 : 0;
+        uint32_t high = bands[i] + 500000;
+        set_button_active(s_band_btns[i], active_hz >= low && active_hz <= high);
+    }
+}
+
+static void update_ui(void)
+{
+    if (bsp_display_lock(pdMS_TO_TICKS(100))) {
+        update_ui_locked();
+        bsp_display_unlock();
+    }
+}
+
+static void create_wifi_ui(void)
+{
+    s_screen = SCREEN_WIFI;
+    lv_obj_t *scr = lv_scr_act();
+    lv_obj_clean(scr);
+    lv_obj_set_style_bg_color(scr, C_BG, LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_clear_flag(scr, LV_OBJ_FLAG_SCROLLABLE);
+
+    create_top_bar(scr, true);
+
+    box(scr, 8, 52, 392, 540, C_PANEL);
+    label(scr, "WIFI", 24, 72, &lv_font_montserrat_24, C_TEXT);
+    label(scr, "SCAN RESULT", 286, 76, &lv_font_montserrat_14, C_MUTED);
+    lv_obj_t *ap_list = box(scr, 24, 112, 360, 360, C_BG);
+    lv_obj_set_style_bg_opa(ap_list, LV_OPA_TRANSP, LV_PART_MAIN);
+    lv_obj_set_style_border_width(ap_list, 0, LV_PART_MAIN);
+    lv_obj_set_scroll_dir(ap_list, LV_DIR_VER);
+    lv_obj_set_scrollbar_mode(ap_list, LV_SCROLLBAR_MODE_AUTO);
+    lv_obj_add_flag(ap_list, LV_OBJ_FLAG_SCROLLABLE);
+    const int shown_count = s_wifi_ap_count > 0 ? s_wifi_ap_count : 1;
+    for (int i = 0; i < shown_count; ++i) {
+        char ap_text[96] = {};
+        if (i < s_wifi_ap_count) {
+            snprintf(ap_text, sizeof(ap_text), "%-18s %d\n%s - CH %u", s_wifi_aps[i].ssid,
+                     s_wifi_aps[i].rssi, wifi_auth_text(s_wifi_aps[i].authmode), s_wifi_aps[i].channel);
+            snprintf(s_wifi_ap_ids[i], sizeof(s_wifi_ap_ids[i]), "AP_%02d", i);
+        } else {
+            snprintf(ap_text, sizeof(ap_text), "NO SCAN RESULT\nTOUCH SCAN");
+        }
+        lv_obj_t *net = button(ap_list, ap_text, i < s_wifi_ap_count ? s_wifi_ap_ids[i] : "noop",
+                               0, i * 82, 350, 70, &lv_font_montserrat_20);
+        if (i < s_wifi_ap_count && strcmp(s_wifi_aps[i].ssid, s_wifi_ssid) == 0) {
+            set_button_active(net, true);
+        }
+    }
+    button(scr, "SCAN", "WIFI_SCAN", 24, 490, 168, 60, &lv_font_montserrat_22);
+    button(scr, "FORGET", "noop", 216, 490, 168, 60, &lv_font_montserrat_22);
+
+    box(scr, 414, 52, 602, 210, C_PANEL);
+    label(scr, "CONNECTION", 430, 72, &lv_font_montserrat_24, C_TEXT);
+    s_wifi_page_status_label = label(scr, wifi_page_status_text(), 840, 76, &lv_font_montserrat_24,
+                                     s_wifi_state == WIFI_STATE_ONLINE ? C_CYAN : C_MUTED);
+    box(scr, 430, 112, 270, 54, C_BTN);
+    label(scr, "SSID", 444, 124, &lv_font_montserrat_14, C_MUTED);
+    s_wifi_conn_ssid_label = label(scr, s_wifi_state == WIFI_STATE_ONLINE ? s_wifi_ssid : "--", 520, 122, &lv_font_montserrat_18, C_TEXT);
+    box(scr, 718, 112, 282, 54, C_BTN);
+    label(scr, "IP ADDRESS", 732, 124, &lv_font_montserrat_14, C_MUTED);
+    s_wifi_ip_label = label(scr, s_wifi_ip, 846, 122, &lv_font_montserrat_18, C_CYAN);
+    box(scr, 430, 184, 270, 54, C_BTN);
+    label(scr, "GATEWAY", 444, 196, &lv_font_montserrat_14, C_MUTED);
+    s_wifi_gateway_label = label(scr, s_wifi_gateway, 548, 194, &lv_font_montserrat_18, C_TEXT);
+    box(scr, 718, 184, 282, 54, C_BTN);
+    label(scr, "DNS", 732, 196, &lv_font_montserrat_14, C_MUTED);
+    s_wifi_dns_label = label(scr, s_wifi_dns, 846, 194, &lv_font_montserrat_18, C_TEXT);
+
+    box(scr, 414, 282, 602, 310, C_PANEL);
+    label(scr, "CONFIG", 430, 302, &lv_font_montserrat_24, C_TEXT);
+    label(scr, "TOUCH INPUT", 874, 308, &lv_font_montserrat_14, C_MUTED);
+    box(scr, 430, 360, 570, 58, C_BTN);
+    label(scr, "SSID", 446, 379, &lv_font_montserrat_16, C_MUTED);
+    label(scr, s_wifi_ssid[0] ? s_wifi_ssid : "--", 556, 374, &lv_font_montserrat_22, C_TEXT);
+    touch_zone(scr, "EDIT_SSID", 430, 360, 570, 58);
+    char pass_buf[24] = {};
+    password_mask(pass_buf, sizeof(pass_buf));
+    box(scr, 430, 438, 570, 58, C_BTN);
+    label(scr, "PASSWORD", 446, 457, &lv_font_montserrat_16, C_MUTED);
+    label(scr, pass_buf, 556, 452, &lv_font_montserrat_22, C_TEXT);
+    touch_zone(scr, "EDIT_PASS", 430, 438, 570, 58);
+    button(scr, "CONNECT", "WIFI_CONNECT", 430, 522, 270, 54, &lv_font_montserrat_20);
+    button(scr, "DISCONNECT", "WIFI_DISCONNECT", 730, 522, 270, 54, &lv_font_montserrat_20);
+
+    update_ui_locked();
+}
+
+static void create_wifi_keyboard_ui(void)
+{
+    s_screen = SCREEN_WIFI_KEYBOARD;
+    lv_obj_t *scr = lv_scr_act();
+    lv_obj_clean(scr);
+    lv_obj_set_style_bg_color(scr, C_BG, LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_clear_flag(scr, LV_OBJ_FLAG_SCROLLABLE);
+
+    create_top_bar(scr, true);
+    box(scr, 38, 58, 948, 512, C_PANEL);
+    label(scr, "WIFI INPUT", 62, 80, &lv_font_montserrat_24, C_TEXT);
+    label(scr, s_wifi_edit_field == WIFI_EDIT_SSID ? "SSID" : "PASSWORD", 746, 86, &lv_font_montserrat_14, C_MUTED);
+    box(scr, 62, 126, 900, 62, C_BTN);
+    size_t target_size = 0;
+    char *target = wifi_edit_target(&target_size);
+    (void)target_size;
+    label(scr, target[0] ? target : "--", 84, 144, &lv_font_montserrat_24, C_CYAN);
+
+    const char *row1[] = {"1", "2", "3", "4", "5", "6", "7", "8", "9", "0"};
+    const char *id1[] = {"K_1", "K_2", "K_3", "K_4", "K_5", "K_6", "K_7", "K_8", "K_9", "K_0"};
+    for (int i = 0; i < 10; ++i) {
+        button(scr, row1[i], id1[i], 62 + i * 90, 214, 76, 48, &lv_font_montserrat_22);
+    }
+
+    const char *row2_upper[] = {"Q", "W", "E", "R", "T", "Y", "U", "I", "O", "P"};
+    const char *row2_lower[] = {"q", "w", "e", "r", "t", "y", "u", "i", "o", "p"};
+    const char *id2_upper[] = {"K_Q", "K_W", "K_E", "K_R", "K_T", "K_Y", "K_U", "K_I", "K_O", "K_P"};
+    const char *id2_lower[] = {"K_q", "K_w", "K_e", "K_r", "K_t", "K_y", "K_u", "K_i", "K_o", "K_p"};
+    for (int i = 0; i < 10; ++i) {
+        button(scr, s_kb_upper ? row2_upper[i] : row2_lower[i], s_kb_upper ? id2_upper[i] : id2_lower[i],
+               62 + i * 90, 276, 76, 48, &lv_font_montserrat_22);
+    }
+
+    const char *row3_upper[] = {"A", "S", "D", "F", "G", "H", "J", "K", "L"};
+    const char *row3_lower[] = {"a", "s", "d", "f", "g", "h", "j", "k", "l"};
+    const char *id3_upper[] = {"K_A", "K_S", "K_D", "K_F", "K_G", "K_H", "K_J", "K_K", "K_L"};
+    const char *id3_lower[] = {"K_a", "K_s", "K_d", "K_f", "K_g", "K_h", "K_j", "K_k", "K_l"};
+    for (int i = 0; i < 9; ++i) {
+        button(scr, s_kb_upper ? row3_upper[i] : row3_lower[i], s_kb_upper ? id3_upper[i] : id3_lower[i],
+               104 + i * 90, 338, 76, 48, &lv_font_montserrat_22);
+    }
+
+    const char *row4_upper[] = {"Z", "X", "C", "V", "B", "N", "M", ".", "-"};
+    const char *row4_lower[] = {"z", "x", "c", "v", "b", "n", "m", "_", "@"};
+    const char *id4_upper[] = {"K_Z", "K_X", "K_C", "K_V", "K_B", "K_N", "K_M", "K_.", "K_-"};
+    const char *id4_lower[] = {"K_z", "K_x", "K_c", "K_v", "K_b", "K_n", "K_m", "K__", "K_@"};
+    for (int i = 0; i < 9; ++i) {
+        button(scr, s_kb_upper ? row4_upper[i] : row4_lower[i], s_kb_upper ? id4_upper[i] : id4_lower[i],
+               104 + i * 90, 400, 76, 48, &lv_font_montserrat_22);
+    }
+
+    button(scr, "SHIFT", "K_SHIFT", 62, 480, 120, 54, &lv_font_montserrat_18);
+    button(scr, "CLEAR", "K_CLR", 198, 480, 104, 54, &lv_font_montserrat_18);
+    button(scr, "SPACE", "K_SPACE", 318, 480, 226, 54, &lv_font_montserrat_18);
+    button(scr, "BACK", "K_BS", 560, 480, 120, 54, &lv_font_montserrat_18);
+    button(scr, "CANCEL", "KB_CANCEL", 696, 480, 120, 54, &lv_font_montserrat_18);
+    button(scr, "DONE", "KB_DONE", 832, 480, 130, 54, &lv_font_montserrat_18);
+
+    update_ui_locked();
+}
+
+static void create_ui(void)
+{
+    s_screen = SCREEN_MAIN;
+    lv_obj_t *scr = lv_scr_act();
+    lv_obj_clean(scr);
+    lv_obj_set_style_bg_color(scr, C_BG, LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_clear_flag(scr, LV_OBJ_FLAG_SCROLLABLE);
+
+    create_top_bar(scr, false);
+
+    const int left_w = 398;
+    box(scr, 8, 52, left_w, 150, C_PANEL);
+    label(scr, "FREQUENCY  DUAL VFO", 24, 68, &lv_font_montserrat_14, C_MUTED);
+    s_vfo_a_tag = label(scr, "VFO-A", 26, 104, &lv_font_montserrat_16, C_CYAN);
+    s_freq_a = label(scr, "00.000.000", 90, 88, &lv_font_montserrat_40, C_TEXT);
+    s_vfo_a_meta = label(scr, "--\n--W", 330, 92, &lv_font_montserrat_18, C_CYAN);
+    s_vfo_b_tag = label(scr, "VFO-B", 26, 158, &lv_font_montserrat_16, C_MUTED);
+    s_freq_b = label(scr, "00.000.000", 90, 142, &lv_font_montserrat_40, C_TEXT);
+    s_vfo_b_meta = label(scr, "--\n--W", 330, 146, &lv_font_montserrat_18, C_CYAN);
+
+    box(scr, 8, 212, left_w, 380, C_PANEL);
+    label(scr, "DIRECT FREQUENCY", 24, 230, &lv_font_montserrat_16, C_TEXT);
+    s_input_hint = label(scr, "A  --.---", 280, 230, &lv_font_montserrat_16, C_MUTED);
+    const int kx = 22, ky = 258, kw = 116, kh = 46, gap = 7;
+    const char *keys[5][3] = {
+        {"1", "2", "3"},
+        {"4", "5", "6"},
+        {"7", "8", "9"},
+        {".", "0", "BS"},
+        {"A", "B", "A/B"},
+    };
+    const char *ids[5][3] = {
+        {"1", "2", "3"},
+        {"4", "5", "6"},
+        {"7", "8", "9"},
+        {".", "0", "BS"},
+        {"TARGET_A", "TARGET_B", "AB"},
+    };
+    for (int r = 0; r < 5; ++r) {
+        for (int c = 0; c < 3; ++c) {
+            button(scr, keys[r][c], ids[r][c], kx + c * (kw + gap), ky + r * (kh + gap), kw, kh,
+                   r == 4 ? &lv_font_montserrat_22 : &lv_font_montserrat_26);
+        }
+    }
+    button(scr, "CLR", "CLR", 22, 540, 178, 44, &lv_font_montserrat_18);
+    button(scr, "ENTER / SET", "SET", 208, 540, 176, 44, &lv_font_montserrat_18);
+
+    const int rx = 420;
+    box(scr, rx, 52, 286, 266, C_PANEL);
+    label(scr, "RF POWER", rx + 16, 70, &lv_font_montserrat_16, C_TEXT);
+    label(scr, "PC COMMAND", rx + 188, 72, &lv_font_montserrat_14, C_MUTED);
+    s_power_step_btns[0] = button(scr, "2W", "P2", rx + 18, 104, 80, 48, &lv_font_montserrat_18);
+    s_power_step_btns[1] = button(scr, "5W", "P5", rx + 104, 104, 80, 48, &lv_font_montserrat_18);
+    s_power_step_btns[2] = button(scr, "10W", "P10", rx + 190, 104, 80, 48, &lv_font_montserrat_18);
+    s_power_label = label(scr, "46W", rx + 78, 170, &lv_font_montserrat_48, C_TEXT);
+    button(scr, "-", "P-", rx + 18, 252, 122, 50, &lv_font_montserrat_36);
+    button(scr, "+", "P+", rx + 150, 252, 122, 50, &lv_font_montserrat_36);
+
+    box(scr, 718, 52, 298, 266, C_PANEL);
+    label(scr, "DNR", 734, 70, &lv_font_montserrat_16, C_TEXT);
+    s_dnr_cmd_label = label(scr, "RL000", 946, 72, &lv_font_montserrat_14, C_MUTED);
+    button(scr, "-", "D-", 734, 112, 76, 188, &lv_font_montserrat_40);
+    s_dnr_label = label(scr, "OFF", 822, 168, &lv_font_montserrat_40, C_CYAN);
+    label(scr, "DNR LEVEL", 826, 232, &lv_font_montserrat_14, C_MUTED);
+    button(scr, "+", "D+", 924, 112, 76, 188, &lv_font_montserrat_40);
+
+    box(scr, rx, 330, 286, 262, C_PANEL);
+    label(scr, "MODE", rx + 16, 348, &lv_font_montserrat_16, C_TEXT);
+    s_mode_btns[0] = button(scr, "LSB", "M_LSB", rx + 18, 386, 122, 58, &lv_font_montserrat_24);
+    s_mode_btns[1] = button(scr, "USB", "M_USB", rx + 150, 386, 122, 58, &lv_font_montserrat_24);
+    s_mode_btns[2] = button(scr, "FM", "M_FM", rx + 18, 454, 122, 58, &lv_font_montserrat_24);
+    s_mode_btns[3] = button(scr, "AM", "M_AM", rx + 150, 454, 122, 58, &lv_font_montserrat_24);
+    s_mode_btns[4] = button(scr, "DATA-U", "M_DATA", rx + 18, 522, 254, 50, &lv_font_montserrat_24);
+
+    box(scr, 718, 330, 298, 262, C_PANEL);
+    label(scr, "BAND", 734, 348, &lv_font_montserrat_16, C_TEXT);
+    label(scr, "MHz", 968, 350, &lv_font_montserrat_14, C_MUTED);
+    const char *band_txt[6] = {"3.5", "7", "14", "21", "28", "50"};
+    const char *band_id[6] = {"B_3.5", "B_7", "B_14", "B_21", "B_28", "B_50"};
+    for (int i = 0; i < 6; ++i) {
+        int col = i % 3;
+        int row = i / 3;
+        s_band_btns[i] = button(scr, band_txt[i], band_id[i], 734 + col * 90, 386 + row * 94, 80, 74, &lv_font_montserrat_32);
+    }
+
+    update_ui_locked();
+}
+
+static void apply_command(cdc_acm_dev_hdl_t dev, app_cmd_t *cmd)
+{
+    char out[24] = {};
+    int64_t elapsed_ms = 0;
+    esp_err_t err = ESP_OK;
+    switch (cmd->type) {
+    case CMD_SET_FREQ:
+        snprintf(out, sizeof(out), "F%c%09lu;", cmd->vfo, (unsigned long)cmd->hz);
+        err = cat_send(dev, out, &elapsed_ms);
+        break;
+    case CMD_SET_POWER:
+        if (cmd->value < 5) cmd->value = 5;
+        if (cmd->value > 100) cmd->value = 100;
+        snprintf(out, sizeof(out), "PC%03u;", cmd->value);
+        err = cat_send(dev, out, &elapsed_ms);
+        break;
+    case CMD_ADJUST_POWER: {
+        int p = (int)s_state.power_w + cmd->delta * (int)s_power_step;
+        if (p < 5) p = 5;
+        if (p > 100) p = 100;
+        snprintf(out, sizeof(out), "PC%03d;", p);
+        err = cat_send(dev, out, &elapsed_ms);
+        break;
+    }
+    case CMD_SET_POWER_STEP:
+        s_power_step = cmd->value;
+        update_ui();
+        return;
+    case CMD_SET_DNR_LEVEL:
+        if (cmd->value == 0) {
+            snprintf(out, sizeof(out), "NR00;");
+            err = cat_send(dev, out, &elapsed_ms);
+        } else {
+            uint8_t level = cmd->value > 15 ? 15 : cmd->value;
+            snprintf(out, sizeof(out), "RL0%02u;", level);
+            err = cat_send(dev, out, &elapsed_ms);
+            if (err == ESP_OK) {
+                vTaskDelay(pdMS_TO_TICKS(20));
+                err = cat_send(dev, "NR01;", &elapsed_ms);
+            }
+        }
+        break;
+    case CMD_ADJUST_DNR: {
+        int level = s_state.dnr_on ? s_state.dnr_level : 0;
+        level += cmd->delta;
+        if (level <= 0) {
+            snprintf(out, sizeof(out), "NR00;");
+            err = cat_send(dev, out, &elapsed_ms);
+        } else {
+            if (level > 15) level = 15;
+            snprintf(out, sizeof(out), "RL0%02d;", level);
+            err = cat_send(dev, out, &elapsed_ms);
+            if (err == ESP_OK) {
+                vTaskDelay(pdMS_TO_TICKS(40));
+                err = cat_send(dev, "NR01;", &elapsed_ms);
+            }
+        }
+        break;
+    }
+    case CMD_SET_MODE:
+        snprintf(out, sizeof(out), "MD%c%X;", cmd->vfo == 'B' ? '1' : '0', radio_state_mode_code(cmd->mode));
+        err = cat_send(dev, out, &elapsed_ms);
+        break;
+    case CMD_SELECT_MAIN_VFO:
+        snprintf(out, sizeof(out), "VS%c;", cmd->vfo == 'B' ? '1' : '0');
+        err = cat_send(dev, out, &elapsed_ms);
+        break;
+    case CMD_SET_BAND_FREQ:
+        snprintf(out, sizeof(out), "F%c%09lu;", cmd->vfo, (unsigned long)cmd->hz);
+        err = cat_send(dev, out, &elapsed_ms);
+        break;
+    default:
+        return;
+    }
+    ESP_LOGI(TAG, "CAT set %s -> %s (%lld ms)", out, esp_err_to_name(err), elapsed_ms);
+}
+
+#define WIFI_CONNECTED_BIT BIT0
+#define WIFI_FAIL_BIT BIT1
+
+static void wifi_save_config(void)
+{
+    nvs_handle_t nvs = 0;
+    if (nvs_open("wifi", NVS_READWRITE, &nvs) != ESP_OK) {
+        return;
+    }
+    nvs_set_str(nvs, "ssid", s_wifi_ssid);
+    nvs_set_str(nvs, "password", s_wifi_edit_value);
+    nvs_commit(nvs);
+    nvs_close(nvs);
+}
+
+static void wifi_load_config(void)
+{
+    nvs_handle_t nvs = 0;
+    if (nvs_open("wifi", NVS_READONLY, &nvs) != ESP_OK) {
+        return;
+    }
+    size_t len = sizeof(s_wifi_ssid);
+    nvs_get_str(nvs, "ssid", s_wifi_ssid, &len);
+    len = sizeof(s_wifi_edit_value);
+    nvs_get_str(nvs, "password", s_wifi_edit_value, &len);
+    nvs_close(nvs);
+}
+
+static void start_sntp_once(void)
+{
+    if (s_sntp_started) {
+        return;
+    }
+    s_sntp_started = true;
+    esp_sntp_setoperatingmode(SNTP_OPMODE_POLL);
+    esp_sntp_setservername(0, "pool.ntp.org");
+    esp_sntp_setservername(1, "time.google.com");
+    esp_sntp_init();
+}
+
+static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data)
+{
+    (void)arg;
+    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        if (s_wifi_manual_disconnect) {
+            s_wifi_manual_disconnect = false;
+            s_wifi_state = WIFI_STATE_READY;
+            clear_wifi_addrs();
+            update_ui();
+            return;
+        }
+        s_wifi_state = WIFI_STATE_FAILED;
+        clear_wifi_addrs();
+        if (s_wifi_retry < 5) {
+            s_wifi_retry++;
+            s_wifi_state = WIFI_STATE_CONNECTING;
+            esp_wifi_connect();
+        } else if (s_wifi_event_group) {
+            xEventGroupSetBits(s_wifi_event_group, WIFI_FAIL_BIT);
+        }
+        update_ui();
+    } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
+        ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
+        snprintf(s_wifi_ip, sizeof(s_wifi_ip), IPSTR, IP2STR(&event->ip_info.ip));
+        snprintf(s_wifi_gateway, sizeof(s_wifi_gateway), IPSTR, IP2STR(&event->ip_info.gw));
+        esp_netif_dns_info_t dns_info = {};
+        if (s_wifi_netif && esp_netif_get_dns_info(s_wifi_netif, ESP_NETIF_DNS_MAIN, &dns_info) == ESP_OK) {
+            snprintf(s_wifi_dns, sizeof(s_wifi_dns), IPSTR, IP2STR(&dns_info.ip.u_addr.ip4));
+        }
+        s_wifi_retry = 0;
+        s_wifi_state = WIFI_STATE_ONLINE;
+        wifi_save_config();
+        start_sntp_once();
+        if (s_wifi_event_group) {
+            xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
+        }
+        update_ui();
+    }
+}
+
+static void wifi_scan(void)
+{
+    s_wifi_state = WIFI_STATE_SCANNING;
+    update_ui();
+    wifi_scan_config_t scan_config = {
+        .ssid = NULL,
+        .bssid = NULL,
+        .channel = 0,
+        .show_hidden = false,
+    };
+    esp_err_t err = esp_wifi_scan_start(&scan_config, true);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "WiFi scan failed: %s", esp_err_to_name(err));
+        s_wifi_state = WIFI_STATE_FAILED;
+        update_ui();
+        return;
+    }
+
+    uint16_t count = 0;
+    ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_scan_get_ap_num(&count));
+    wifi_ap_record_t records[WIFI_AP_MAX] = {};
+    uint16_t request = count > WIFI_AP_MAX ? WIFI_AP_MAX : count;
+    ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_scan_get_ap_records(&request, records));
+    s_wifi_ap_count = request;
+    for (int i = 0; i < s_wifi_ap_count; ++i) {
+        strlcpy(s_wifi_aps[i].ssid, (const char *)records[i].ssid, sizeof(s_wifi_aps[i].ssid));
+        s_wifi_aps[i].rssi = records[i].rssi;
+        s_wifi_aps[i].channel = records[i].primary;
+        s_wifi_aps[i].authmode = records[i].authmode;
+        ESP_LOGI(TAG, "WiFi AP[%d]: ssid='%s' rssi=%d channel=%u auth=%s", i, s_wifi_aps[i].ssid,
+                 s_wifi_aps[i].rssi, s_wifi_aps[i].channel, wifi_auth_text(s_wifi_aps[i].authmode));
+    }
+    ESP_LOGI(TAG, "WiFi scan complete: %u AP shown, %u AP total", s_wifi_ap_count, count);
+    s_wifi_state = WIFI_STATE_READY;
+    if (bsp_display_lock(pdMS_TO_TICKS(100))) {
+        if (s_screen == SCREEN_WIFI) {
+            create_wifi_ui();
+        } else {
+            update_ui_locked();
+        }
+        bsp_display_unlock();
+    }
+}
+
+static void wifi_connect_current(void)
+{
+    wifi_config_t wifi_config = {};
+    strlcpy((char *)wifi_config.sta.ssid, s_wifi_ssid, sizeof(wifi_config.sta.ssid));
+    strlcpy((char *)wifi_config.sta.password, s_wifi_edit_value, sizeof(wifi_config.sta.password));
+    wifi_config.sta.threshold.authmode = strlen(s_wifi_edit_value) ? WIFI_AUTH_WPA2_PSK : WIFI_AUTH_OPEN;
+    wifi_config.sta.sae_pwe_h2e = WPA3_SAE_PWE_BOTH;
+
+    s_wifi_retry = 0;
+    s_wifi_manual_disconnect = false;
+    s_wifi_state = WIFI_STATE_CONNECTING;
+    clear_wifi_addrs();
+    ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_disconnect());
+    ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
+    esp_err_t err = esp_wifi_connect();
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "WiFi connect failed: %s", esp_err_to_name(err));
+        s_wifi_state = WIFI_STATE_FAILED;
+    }
+    update_ui();
+}
+
+static void wifi_manager_task(void *arg)
+{
+    (void)arg;
+    esp_err_t ret = nvs_flash_init();
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        ret = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(ret);
+    wifi_load_config();
+
+    s_wifi_event_group = xEventGroupCreate();
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+    s_wifi_netif = esp_netif_create_default_wifi_sta();
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID,
+                                                        &wifi_event_handler, NULL, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP,
+                                                        &wifi_event_handler, NULL, NULL));
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    ESP_ERROR_CHECK(esp_wifi_start());
+    s_wifi_state = WIFI_STATE_READY;
+    ESP_LOGI(TAG, "ESP-Hosted WiFi ready, SSID='%s'", s_wifi_ssid);
+    update_ui();
+
+    send_wifi_cmd(WIFI_CMD_SCAN);
+    wifi_cmd_t cmd = {};
+    while (true) {
+        if (xQueueReceive(s_wifi_cmd_queue, &cmd, portMAX_DELAY) != pdTRUE) {
+            continue;
+        }
+        switch (cmd.type) {
+        case WIFI_CMD_SCAN:
+            wifi_scan();
+            break;
+        case WIFI_CMD_CONNECT:
+            wifi_connect_current();
+            break;
+        case WIFI_CMD_DISCONNECT:
+            s_wifi_manual_disconnect = true;
+            s_wifi_retry = 5;
+            ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_disconnect());
+            s_wifi_state = WIFI_STATE_READY;
+            clear_wifi_addrs();
+            update_ui();
+            break;
+        default:
+            break;
+        }
+    }
+}
+
+static void poll_one(cdc_acm_dev_hdl_t dev, const char *cmd, char *resp, size_t resp_size)
+{
+    int64_t elapsed = 0;
+    esp_err_t err = cat_query(dev, cmd, resp, resp_size, &elapsed);
+    s_state.last_cat_ms = (uint32_t)elapsed;
+    if (err != ESP_OK) {
+        s_state.fail_count++;
+        ESP_LOGW(TAG, "CAT query %s failed: %s resp='%s'", cmd, esp_err_to_name(err), resp);
+        return;
+    }
+    s_state.ok_count++;
+    uint32_t hz = 0;
+    uint8_t v = 0;
+    bool b = false;
+    ft710_mode_t mode = FT710_MODE_UNKNOWN;
+    if (parse_vfo_hz(resp, "FA", &hz)) s_state.vfo_a_hz = hz;
+    else if (parse_vfo_hz(resp, "FB", &hz)) s_state.vfo_b_hz = hz;
+    else if (parse_mode(resp, "MD0", &mode)) s_state.mode_a = mode;
+    else if (parse_mode(resp, "MD1", &mode)) s_state.mode_b = mode;
+    else if (parse_u8_3(resp, "PC", &v)) s_state.power_w = v;
+    else if (parse_bool_4(resp, "NR0", &b)) s_state.dnr_on = b;
+    else if (parse_u8_3(resp, "RL0", &v)) s_state.dnr_level = v;
+    else if (resp[0] == 'V' && resp[1] == 'S' && resp[3] == ';') s_state.active_vfo = resp[2] == '1' ? 'B' : 'A';
+}
+
+static void cat_task(void *arg)
+{
+    (void)arg;
+    const usb_host_config_t host_config = {
+        .skip_phy_setup = false,
+        .root_port_unpowered = false,
+        .intr_flags = ESP_INTR_FLAG_LEVEL1,
+    };
+    ESP_ERROR_CHECK(usb_host_install(&host_config));
+    BaseType_t task_created = xTaskCreate(usb_lib_task, "usb_lib", 4096, NULL, 10, NULL);
+    assert(task_created == pdTRUE);
+    ESP_ERROR_CHECK(cdc_acm_host_install(NULL));
+
+    const cdc_acm_host_device_config_t dev_config = {
+        .connection_timeout_ms = 20000,
+        .out_buffer_size = 512,
+        .in_buffer_size = 512,
+        .event_cb = event_cb,
+        .data_cb = rx_cb,
+        .user_arg = NULL,
+    };
+
+    cdc_acm_dev_hdl_t dev = NULL;
+    ESP_LOGI(TAG, "Waiting for CH9102 1A86:55D4");
+    esp_err_t err = cdc_acm_host_open(0x1A86, 0x55D4, 0, &dev_config, &dev);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to open CH9102: %s", esp_err_to_name(err));
+        vTaskDelete(NULL);
+    }
+
+    const cdc_acm_line_coding_t line_coding = {
+        .dwDTERate = 38400,
+        .bCharFormat = 0,
+        .bParityType = 0,
+        .bDataBits = 8,
+    };
+    ESP_ERROR_CHECK(cdc_acm_host_line_coding_set(dev, &line_coding));
+    ESP_ERROR_CHECK(cdc_acm_host_set_control_line_state(dev, false, false));
+    s_state.online = true;
+    ESP_LOGI(TAG, "CH9102 opened, FT-710 control UI running");
+
+    char resp[64] = {};
+    const char *slow_polls[] = {"ID;", "MD0;", "MD1;", "PC;", "NR0;", "RL0;", "VS;"};
+    size_t slow_idx = 0;
+    uint32_t loop_count = 0;
+    while (true) {
+        app_cmd_t cmd = {};
+        while (xQueueReceive(s_cmd_queue, &cmd, 0) == pdTRUE) {
+            apply_command(dev, &cmd);
+        }
+        memset(resp, 0, sizeof(resp));
+        poll_one(dev, "FA;", resp, sizeof(resp));
+        memset(resp, 0, sizeof(resp));
+        poll_one(dev, "FB;", resp, sizeof(resp));
+        if ((loop_count % 3) == 0) {
+            memset(resp, 0, sizeof(resp));
+            poll_one(dev, slow_polls[slow_idx], resp, sizeof(resp));
+            slow_idx = (slow_idx + 1) % (sizeof(slow_polls) / sizeof(slow_polls[0]));
+        }
+        loop_count++;
+        update_ui();
+        vTaskDelay(pdMS_TO_TICKS(70));
+    }
+}
+
+void app_controller_start(void)
+{
+    setenv("TZ", "CST-8", 1);
+    tzset();
+    radio_state_init(&s_state);
+    s_rx_queue = xQueueCreate(512, sizeof(rx_byte_t));
+    s_cmd_queue = xQueueCreate(16, sizeof(app_cmd_t));
+    s_wifi_cmd_queue = xQueueCreate(8, sizeof(wifi_cmd_t));
+    assert(s_rx_queue && s_cmd_queue && s_wifi_cmd_queue);
+
+    bsp_display_cfg_t cfg = {
+        .lv_adapter_cfg = ESP_LV_ADAPTER_DEFAULT_CONFIG(),
+        .rotation = ESP_LV_ADAPTER_ROTATE_0,
+        .tear_avoid_mode = ESP_LV_ADAPTER_TEAR_AVOID_MODE_TRIPLE_PARTIAL,
+        .touch_flags = {
+            .swap_xy = 0,
+            .mirror_x = 1,
+            .mirror_y = 1,
+        },
+    };
+    lv_display_t *display = bsp_display_start_with_config(&cfg);
+    ESP_ERROR_CHECK(display != NULL ? ESP_OK : ESP_FAIL);
+    bsp_display_backlight_on();
+
+    ESP_ERROR_CHECK(bsp_display_lock(-1) ? ESP_OK : ESP_ERR_TIMEOUT);
+    create_ui();
+    bsp_display_unlock();
+
+    BaseType_t wifi_task_created = xTaskCreate(wifi_manager_task, "wifi_manager", 8192, NULL, 6, NULL);
+    assert(wifi_task_created == pdTRUE);
+
+    BaseType_t task_created = xTaskCreate(cat_task, "cat_task", 8192, NULL, 8, NULL);
+    assert(task_created == pdTRUE);
+}

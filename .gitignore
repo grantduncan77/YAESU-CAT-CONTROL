@@ -1,0 +1,29 @@
+# ESP-IDF build outputs
+build/
+**/build/
+**/managed_components/*
+
+# Keep the locally modified USB component used by the JI1FGX/Hub experiment.
+!ft710_ji1fgx_probe/managed_components/
+!ft710_ji1fgx_probe/managed_components/espressif__usb/
+!ft710_ji1fgx_probe/managed_components/espressif__usb/**
+
+# Local vendor/reference downloads, not project source.
+ESP32-P4-WIFI6-Touch-LCD-7B-main/
+third_party/
+
+# Editor and OS noise
+.vscode/
+.idea/
+*.swp
+*.tmp
+Thumbs.db
+Desktop.ini
+
+# Binary/archive artifacts
+*.zip
+*.7z
+*.rar
+*.bin
+*.elf
+*.map

@@ -116,7 +116,6 @@ typedef struct {
 #define MCP23017_FREQ_ENCODER_MASK 0x07
 #define MCP23017_POWER_ENCODER_A_MASK (BIT(6) | BIT(7))
 #define MCP23017_POWER_ENCODER_B_MASK BIT(0)
-#define POWER_ENCODER_STEP_W 1
 #define AUX_I2C_HZ 100000
 #define AUX_OLED_WIDTH 128
 #define AUX_OLED_HEIGHT 64
@@ -135,6 +134,7 @@ static radio_state_t s_state;
 static char s_input[18];
 static char s_input_target_vfo = 'A';
 static uint8_t s_power_step = 2;
+static bool s_power_encoder_selecting_step;
 static app_screen_t s_screen = SCREEN_MAIN;
 static time_view_t s_time_view = TIME_LOCAL;
 static wifi_state_t s_wifi_state = WIFI_STATE_OFF;
@@ -158,7 +158,8 @@ static i2c_master_dev_handle_t s_aux_oled_dev;
 static uint8_t s_aux_oled_frame[AUX_OLED_WIDTH * AUX_OLED_PAGES];
 static uint8_t s_aux_oled_addr;
 static bool s_aux_oled_ready;
-static uint8_t s_aux_oled_last_power = 0xFF;
+static char s_aux_oled_last_title[12];
+static char s_aux_oled_last_value[12];
 
 static lv_obj_t *s_cat_status;
 static lv_obj_t *s_bt_status;
@@ -715,33 +716,57 @@ static void aux_oled_text(int x, int y, const char *text, int scale)
     }
 }
 
-static void aux_oled_draw_power(uint8_t power_w)
+static void aux_oled_draw_status(const char *title, const char *value)
 {
     memset(s_aux_oled_frame, 0, sizeof(s_aux_oled_frame));
     aux_oled_rect(0, 0, AUX_OLED_WIDTH, AUX_OLED_HEIGHT, true);
-    aux_oled_text(6, 4, "RF POWER", 1);
+    aux_oled_text(6, 4, title, 1);
     aux_oled_text(6, 54, "FT-710", 1);
 
-    char value[8] = {};
-    snprintf(value, sizeof(value), "%uW", power_w);
-    const int scale = power_w >= 100 ? 4 : 5;
+    const int scale = strlen(value) > 3 ? 4 : 5;
     const int width = (int)strlen(value) * 6 * scale - scale;
     aux_oled_text((AUX_OLED_WIDTH - width) / 2, 20, value, scale);
 }
 
-static void aux_oled_show_power(uint8_t power_w, bool force)
+static void aux_oled_show_status(const char *title, const char *value, bool force)
 {
-    if (!s_aux_oled_ready || (!force && s_aux_oled_last_power == power_w) || !i2c_take(pdMS_TO_TICKS(50))) {
+    if (!s_aux_oled_ready ||
+        (!force && strcmp(s_aux_oled_last_title, title) == 0 && strcmp(s_aux_oled_last_value, value) == 0) ||
+        !i2c_take(pdMS_TO_TICKS(50))) {
         return;
     }
-    aux_oled_draw_power(power_w);
+    aux_oled_draw_status(title, value);
     const esp_err_t err = aux_oled_flush();
     if (err == ESP_OK) {
-        s_aux_oled_last_power = power_w;
+        strlcpy(s_aux_oled_last_title, title, sizeof(s_aux_oled_last_title));
+        strlcpy(s_aux_oled_last_value, value, sizeof(s_aux_oled_last_value));
     } else {
-        ESP_LOGW(TAG, "Aux OLED power update failed: %s", esp_err_to_name(err));
+        ESP_LOGW(TAG, "Aux OLED update failed: %s", esp_err_to_name(err));
     }
     i2c_give();
+}
+
+static void aux_oled_show_power(uint8_t power_w, bool force)
+{
+    char value[8] = {};
+    snprintf(value, sizeof(value), "%uW", power_w);
+    aux_oled_show_status("RF POWER", value, force);
+}
+
+static void aux_oled_show_power_step(uint8_t step_w, bool force)
+{
+    char value[8] = {};
+    snprintf(value, sizeof(value), "%uW", step_w);
+    aux_oled_show_status("RF STEP", value, force);
+}
+
+static void aux_oled_show_current(bool force)
+{
+    if (s_power_encoder_selecting_step) {
+        aux_oled_show_power_step(s_power_step, force);
+    } else {
+        aux_oled_show_power(s_state.power_w, force);
+    }
 }
 
 static esp_err_t aux_oled_init(void)
@@ -836,13 +861,50 @@ static void encoder_adjust_input(int delta)
     }
 }
 
+static int power_step_index(uint8_t step)
+{
+    const uint8_t steps[] = {2, 5, 10};
+    for (int i = 0; i < (int)(sizeof(steps) / sizeof(steps[0])); ++i) {
+        if (step == steps[i]) {
+            return i;
+        }
+    }
+    return 0;
+}
+
+static void encoder_adjust_power_step(int delta)
+{
+    if (delta == 0) {
+        return;
+    }
+
+    const uint8_t steps[] = {2, 5, 10};
+    int index = power_step_index(s_power_step) + delta;
+    if (index < 0) {
+        index = 0;
+    } else if (index >= (int)(sizeof(steps) / sizeof(steps[0]))) {
+        index = (int)(sizeof(steps) / sizeof(steps[0])) - 1;
+    }
+    if (steps[index] == s_power_step) {
+        return;
+    }
+
+    s_power_step = steps[index];
+    ESP_LOGI(TAG, "Power encoder step select %uW", s_power_step);
+    aux_oled_show_current(true);
+    if (s_screen == SCREEN_MAIN && bsp_display_lock(pdMS_TO_TICKS(50))) {
+        update_ui_locked();
+        bsp_display_unlock();
+    }
+}
+
 static void encoder_adjust_power(int delta)
 {
     if (delta == 0) {
         return;
     }
 
-    int p = (int)s_state.power_w + delta * POWER_ENCODER_STEP_W;
+    int p = (int)s_state.power_w + delta * (int)s_power_step;
     if (p < 5) {
         p = 5;
     } else if (p > 100) {
@@ -853,7 +915,8 @@ static void encoder_adjust_power(int delta)
     }
 
     s_state.power_w = (uint8_t)p;
-    ESP_LOGI(TAG, "Power encoder set %uW", s_state.power_w);
+    ESP_LOGI(TAG, "Power encoder set %uW step=%uW", s_state.power_w, s_power_step);
+    aux_oled_show_current(true);
     const app_cmd_t cmd = {
         .type = CMD_SET_POWER,
         .value = (uint8_t)p,
@@ -989,7 +1052,7 @@ static esp_err_t encoder_mcp23017_init(void)
 
             ESP_LOGI(TAG,
                      "MCP23017 encoder detected at 0x%02X, freq A=PA0 B=PA1 S=PA2 step=%lu Hz, power A=PA6 B=PA7 S=PB0 step=%d W",
-                     candidate, (unsigned long)ENCODER_STEP_HZ, POWER_ENCODER_STEP_W);
+                     candidate, (unsigned long)ENCODER_STEP_HZ, s_power_step);
             return ESP_OK;
         }
     }
@@ -1055,10 +1118,18 @@ static void encoder_task(void *arg)
                 power_quad_accum += quad_table[(prev_power_ab << 2) | power_ab];
                 prev_power_ab = power_ab;
                 if (power_quad_accum >= 4) {
-                    encoder_adjust_power(1);
+                    if (s_power_encoder_selecting_step) {
+                        encoder_adjust_power_step(1);
+                    } else {
+                        encoder_adjust_power(1);
+                    }
                     power_quad_accum = 0;
                 } else if (power_quad_accum <= -4) {
-                    encoder_adjust_power(-1);
+                    if (s_power_encoder_selecting_step) {
+                        encoder_adjust_power_step(-1);
+                    } else {
+                        encoder_adjust_power(-1);
+                    }
                     power_quad_accum = 0;
                 }
             }
@@ -1091,6 +1162,17 @@ static void encoder_task(void *arg)
             if ((now - last_power_button_change) >= pdMS_TO_TICKS(35) &&
                 power_button_released != stable_power_button) {
                 stable_power_button = power_button_released;
+                if (!stable_power_button) {
+                    s_power_encoder_selecting_step = !s_power_encoder_selecting_step;
+                    power_quad_accum = 0;
+                    ESP_LOGI(TAG, "Power encoder %s step select, step=%uW",
+                             s_power_encoder_selecting_step ? "enter" : "exit", s_power_step);
+                    aux_oled_show_current(true);
+                    if (s_screen == SCREEN_MAIN && bsp_display_lock(pdMS_TO_TICKS(50))) {
+                        update_ui_locked();
+                        bsp_display_unlock();
+                    }
+                }
             }
         }
         vTaskDelay(pdMS_TO_TICKS(3));
@@ -1108,9 +1190,9 @@ static void aux_oled_task(void *arg)
         return;
     }
 
-    aux_oled_show_power(s_state.power_w, true);
+    aux_oled_show_current(true);
     while (true) {
-        aux_oled_show_power(s_state.power_w, false);
+        aux_oled_show_current(false);
         vTaskDelay(pdMS_TO_TICKS(100));
     }
 }
@@ -1403,7 +1485,11 @@ static void update_ui_locked(void)
     snprintf(buf, sizeof(buf), "%s\n%uW", radio_state_mode_name(s_state.mode_b), s_state.power_w);
     lv_label_set_text(s_vfo_b_meta, buf);
 
-    snprintf(buf, sizeof(buf), "%uW", s_state.power_w);
+    if (s_power_encoder_selecting_step) {
+        snprintf(buf, sizeof(buf), "STEP %uW", s_power_step);
+    } else {
+        snprintf(buf, sizeof(buf), "%uW", s_state.power_w);
+    }
     lv_label_set_text(s_power_label, buf);
     snprintf(buf, sizeof(buf), "%02u", s_state.dnr_on ? s_state.dnr_level : 0);
     lv_label_set_text(s_dnr_label, s_state.dnr_on ? buf : "OFF");
@@ -1422,6 +1508,9 @@ static void update_ui_locked(void)
     set_button_active(s_power_step_btns[0], s_power_step == 2);
     set_button_active(s_power_step_btns[1], s_power_step == 5);
     set_button_active(s_power_step_btns[2], s_power_step == 10);
+    for (int i = 0; i < 3; ++i) {
+        lv_obj_set_style_border_width(s_power_step_btns[i], s_power_encoder_selecting_step ? 3 : 1, LV_PART_MAIN);
+    }
 
     ft710_mode_t active_mode = s_input_target_vfo == 'B' ? s_state.mode_b : s_state.mode_a;
     const ft710_mode_t modes[5] = {FT710_MODE_LSB, FT710_MODE_USB, FT710_MODE_FM, FT710_MODE_AM, FT710_MODE_DATA_U};
@@ -1698,6 +1787,7 @@ static void apply_command(cdc_acm_dev_hdl_t dev, app_cmd_t *cmd)
     }
     case CMD_SET_POWER_STEP:
         s_power_step = cmd->value;
+        s_power_encoder_selecting_step = false;
         update_ui();
         return;
     case CMD_SET_DNR_LEVEL:

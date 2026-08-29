@@ -35,7 +35,7 @@ The first version intentionally does not implement PTT or transmit control.
 - Optional input: EC11 rotary encoders with buttons -> Waveshare MCP23017 I/O expander -> ESP32-P4 I2C
 - Auxiliary test display: 0.96-inch 128 x 64 SSD1306 I2C OLED through a Qwiic Mux Breakout TCA9548A, channel 3
 
-The current EC11 test wiring is: frequency encoder A -> MCP23017 PA0, B -> PA1, S/button -> PA2; RF Power encoder A -> PA6, B -> PA7, S/button -> PB0. The firmware enables MCP23017 pull-ups on those inputs and auto-scans I2C addresses `0x20` through `0x27`; the tested Waveshare module was detected at `0x27`.
+The current EC11 test wiring is: frequency encoder A -> MCP23017 PA0, B -> PA1, S/button -> PA2; RF Power encoder A -> PA6, B -> PA7, S/button -> PB0. The firmware enables MCP23017 pull-ups on those inputs, uses 100 kHz I2C for the auxiliary I2C devices, prioritizes the tested MCP23017 address `0x27`, and only accepts an address after the MCP23017 registers can be configured successfully.
 
 The current OLED/Mux test wiring is: ESP32-P4 I2C1 `SDA=GPIO7`, `SCL=GPIO8`; TCA9548A default address `0x70`; SSD1306 OLED on mux channel 3, detected at `0x3C`.
 
@@ -114,9 +114,10 @@ Development and hardware tests have confirmed:
 - Dual VFO frequency polling around 100 ms is usable.
 - Main control UI runs on the 1024 x 600 touch screen.
 - RF Power and DNR now use immediate local UI update plus CAT write and later readback correction.
-- MCP23017 + EC11 external encoders are detected over I2C. The frequency encoder adjusts the selected VFO input in 1 kHz steps and sends it on button press; the RF Power encoder sends `PCxxx;` in 1W steps.
+- MCP23017 + EC11 external encoders are detected over I2C at the verified `0x27` address. The frequency encoder adjusts the selected VFO input in 1 kHz steps and sends it on button press; the RF Power encoder sends `PCxxx;` in 1W steps and is available globally.
 - Standalone OLED/Mux/encoder test works: TCA9548A detected at `0x70`, OLED detected at `0x3C` behind channel 3, MCP23017 detected at `0x27`, and rotating the RF Power encoder updates the 0.96-inch OLED power display in 1W steps.
-- Main firmware integration of the auxiliary OLED works at startup: `Aux OLED ready: TCA9548A=0x70 channel=3 SSD1306=0x3C`. The OLED follows the main `power_w` state, so touch power changes, encoder changes, and CAT readback corrections can update the small display.
+- Main firmware integration of the auxiliary OLED works at startup: `Aux OLED ready: TCA9548A=0x70 channel=3 SSD1306=0x3C`. The OLED follows the main `power_w` state from a background task, so touch power changes, encoder changes, and CAT readback corrections can update the small display without blocking UI refresh.
+- Main firmware RF Power encoder verification after the OLED integration fix: `Power encoder set 14W..18W` and CAT `PC014..PC018` all returned `ESP_OK`.
 - Mode buttons now follow the selected A/B input target, so VFO-A sends `MD0x;` and VFO-B sends `MD1x;`.
 - WiFi setup page starts ESP-Hosted WiFi, scans 2.4 GHz APs, and presents a scrollable AP list.
 - Soft keyboard control keys were fixed: `CLEAR`, `BACK`, and `SPACE` now behave correctly.

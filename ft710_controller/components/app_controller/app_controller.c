@@ -117,7 +117,7 @@ typedef struct {
 #define MCP23017_POWER_ENCODER_A_MASK (BIT(6) | BIT(7))
 #define MCP23017_POWER_ENCODER_B_MASK BIT(0)
 #define POWER_ENCODER_STEP_W 1
-#define AUX_OLED_I2C_HZ 100000
+#define AUX_I2C_HZ 100000
 #define AUX_OLED_WIDTH 128
 #define AUX_OLED_HEIGHT 64
 #define AUX_OLED_PAGES (AUX_OLED_HEIGHT / 8)
@@ -762,7 +762,7 @@ static esp_err_t aux_oled_init(void)
     const i2c_device_config_t tca_cfg = {
         .dev_addr_length = I2C_ADDR_BIT_LEN_7,
         .device_address = TCA9548A_ADDR,
-        .scl_speed_hz = AUX_OLED_I2C_HZ,
+        .scl_speed_hz = AUX_I2C_HZ,
     };
     ESP_GOTO_ON_ERROR(i2c_master_bus_add_device(bus, &tca_cfg, &s_tca9548a_dev), cleanup, TAG, "add TCA9548A");
     ESP_GOTO_ON_ERROR(aux_oled_select(), cleanup, TAG, "select aux OLED channel");
@@ -779,7 +779,7 @@ static esp_err_t aux_oled_init(void)
     const i2c_device_config_t oled_cfg = {
         .dev_addr_length = I2C_ADDR_BIT_LEN_7,
         .device_address = addr,
-        .scl_speed_hz = AUX_OLED_I2C_HZ,
+        .scl_speed_hz = AUX_I2C_HZ,
     };
     ESP_GOTO_ON_ERROR(i2c_master_bus_add_device(bus, &oled_cfg, &s_aux_oled_dev), cleanup, TAG, "add aux OLED");
     ESP_GOTO_ON_ERROR(aux_oled_ssd1306_init(), cleanup, TAG, "init aux OLED");
@@ -838,7 +838,7 @@ static void encoder_adjust_input(int delta)
 
 static void encoder_adjust_power(int delta)
 {
-    if (s_screen != SCREEN_MAIN || delta == 0) {
+    if (delta == 0) {
         return;
     }
 
@@ -853,13 +853,14 @@ static void encoder_adjust_power(int delta)
     }
 
     s_state.power_w = (uint8_t)p;
+    ESP_LOGI(TAG, "Power encoder set %uW", s_state.power_w);
     const app_cmd_t cmd = {
         .type = CMD_SET_POWER,
         .value = (uint8_t)p,
     };
     send_cmd(&cmd);
 
-    if (bsp_display_lock(pdMS_TO_TICKS(50))) {
+    if (s_screen == SCREEN_MAIN && bsp_display_lock(pdMS_TO_TICKS(50))) {
         update_ui_locked();
         bsp_display_unlock();
     }
@@ -886,62 +887,115 @@ static esp_err_t mcp23017_read_reg(uint8_t reg, uint8_t *value)
     return err;
 }
 
+static esp_err_t mcp23017_write_reg_retry(uint8_t reg, uint8_t value, const char *name)
+{
+    esp_err_t err = ESP_FAIL;
+    for (int attempt = 1; attempt <= 3; ++attempt) {
+        err = mcp23017_write_reg(reg, value);
+        if (err == ESP_OK) {
+            return ESP_OK;
+        }
+        ESP_LOGW(TAG, "MCP23017 write %s reg=0x%02X value=0x%02X failed attempt %d: %s", name, reg, value, attempt,
+                 esp_err_to_name(err));
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+    return err;
+}
+
 static esp_err_t encoder_mcp23017_init(void)
 {
     ESP_RETURN_ON_ERROR(bsp_i2c_init(), TAG, "init BSP I2C");
     i2c_master_bus_handle_t bus = bsp_i2c_get_handle();
     ESP_RETURN_ON_FALSE(bus, ESP_FAIL, TAG, "BSP I2C handle is null");
 
-    uint8_t addr = 0;
-    for (uint8_t candidate = MCP23017_ADDR_MIN; candidate <= MCP23017_ADDR_MAX; ++candidate) {
+    const uint8_t candidates[] = {0x27, 0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26};
+    esp_err_t last_err = ESP_ERR_NOT_FOUND;
+    for (size_t i = 0; i < sizeof(candidates); ++i) {
+        const uint8_t candidate = candidates[i];
         if (i2c_master_probe(bus, candidate, 100) == ESP_OK) {
-            addr = candidate;
-            break;
+            i2c_device_config_t dev_cfg = {
+                .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+                .device_address = candidate,
+                .scl_speed_hz = AUX_I2C_HZ,
+            };
+            last_err = i2c_master_bus_add_device(bus, &dev_cfg, &s_mcp23017_dev);
+            if (last_err != ESP_OK) {
+                ESP_LOGW(TAG, "MCP23017 add candidate 0x%02X failed: %s", candidate, esp_err_to_name(last_err));
+                s_mcp23017_dev = NULL;
+                continue;
+            }
+
+            ESP_LOGI(TAG, "MCP23017 candidate detected at 0x%02X, configuring at %d Hz", candidate, AUX_I2C_HZ);
+
+            uint8_t iodira = 0xFF;
+            if (mcp23017_read_reg(MCP23017_REG_IODIRA, &iodira) != ESP_OK) {
+                iodira = 0xFF;
+            }
+            last_err = mcp23017_write_reg_retry(MCP23017_REG_IODIRA,
+                                                iodira | MCP23017_FREQ_ENCODER_MASK |
+                                                    MCP23017_POWER_ENCODER_A_MASK,
+                                                "IODIRA");
+            if (last_err != ESP_OK) {
+                ESP_LOGW(TAG, "MCP23017 candidate 0x%02X rejected at IODIRA: %s", candidate,
+                         esp_err_to_name(last_err));
+                i2c_master_bus_rm_device(s_mcp23017_dev);
+                s_mcp23017_dev = NULL;
+                continue;
+            }
+
+            uint8_t gppua = 0;
+            if (mcp23017_read_reg(MCP23017_REG_GPPUA, &gppua) != ESP_OK) {
+                gppua = 0;
+            }
+            last_err = mcp23017_write_reg_retry(MCP23017_REG_GPPUA,
+                                                gppua | MCP23017_FREQ_ENCODER_MASK |
+                                                    MCP23017_POWER_ENCODER_A_MASK,
+                                                "GPPUA");
+            if (last_err != ESP_OK) {
+                ESP_LOGW(TAG, "MCP23017 candidate 0x%02X rejected at GPPUA: %s", candidate,
+                         esp_err_to_name(last_err));
+                i2c_master_bus_rm_device(s_mcp23017_dev);
+                s_mcp23017_dev = NULL;
+                continue;
+            }
+
+            uint8_t iodirb = 0xFF;
+            if (mcp23017_read_reg(MCP23017_REG_IODIRB, &iodirb) != ESP_OK) {
+                iodirb = 0xFF;
+            }
+            last_err = mcp23017_write_reg_retry(MCP23017_REG_IODIRB, iodirb | MCP23017_POWER_ENCODER_B_MASK,
+                                                "IODIRB");
+            if (last_err != ESP_OK) {
+                ESP_LOGW(TAG, "MCP23017 candidate 0x%02X rejected at IODIRB: %s", candidate,
+                         esp_err_to_name(last_err));
+                i2c_master_bus_rm_device(s_mcp23017_dev);
+                s_mcp23017_dev = NULL;
+                continue;
+            }
+
+            uint8_t gppub = 0;
+            if (mcp23017_read_reg(MCP23017_REG_GPPUB, &gppub) != ESP_OK) {
+                gppub = 0;
+            }
+            last_err = mcp23017_write_reg_retry(MCP23017_REG_GPPUB, gppub | MCP23017_POWER_ENCODER_B_MASK,
+                                                "GPPUB");
+            if (last_err != ESP_OK) {
+                ESP_LOGW(TAG, "MCP23017 candidate 0x%02X rejected at GPPUB: %s", candidate,
+                         esp_err_to_name(last_err));
+                i2c_master_bus_rm_device(s_mcp23017_dev);
+                s_mcp23017_dev = NULL;
+                continue;
+            }
+
+            ESP_LOGI(TAG,
+                     "MCP23017 encoder detected at 0x%02X, freq A=PA0 B=PA1 S=PA2 step=%lu Hz, power A=PA6 B=PA7 S=PB0 step=%d W",
+                     candidate, (unsigned long)ENCODER_STEP_HZ, POWER_ENCODER_STEP_W);
+            return ESP_OK;
         }
     }
-    ESP_RETURN_ON_FALSE(addr != 0, ESP_ERR_NOT_FOUND, TAG, "MCP23017 not found on I2C");
 
-    i2c_device_config_t dev_cfg = {
-        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
-        .device_address = addr,
-        .scl_speed_hz = CONFIG_BSP_I2C_CLK_SPEED_HZ,
-    };
-    ESP_RETURN_ON_ERROR(i2c_master_bus_add_device(bus, &dev_cfg, &s_mcp23017_dev), TAG, "add MCP23017");
-
-    uint8_t iodira = 0xFF;
-    if (mcp23017_read_reg(MCP23017_REG_IODIRA, &iodira) != ESP_OK) {
-        iodira = 0xFF;
-    }
-    ESP_RETURN_ON_ERROR(mcp23017_write_reg(MCP23017_REG_IODIRA, iodira | MCP23017_FREQ_ENCODER_MASK |
-                                                                  MCP23017_POWER_ENCODER_A_MASK), TAG,
-                        "set MCP23017 IODIRA");
-
-    uint8_t gppua = 0;
-    if (mcp23017_read_reg(MCP23017_REG_GPPUA, &gppua) != ESP_OK) {
-        gppua = 0;
-    }
-    ESP_RETURN_ON_ERROR(mcp23017_write_reg(MCP23017_REG_GPPUA, gppua | MCP23017_FREQ_ENCODER_MASK |
-                                                                  MCP23017_POWER_ENCODER_A_MASK), TAG,
-                        "set MCP23017 GPPUA");
-
-    uint8_t iodirb = 0xFF;
-    if (mcp23017_read_reg(MCP23017_REG_IODIRB, &iodirb) != ESP_OK) {
-        iodirb = 0xFF;
-    }
-    ESP_RETURN_ON_ERROR(mcp23017_write_reg(MCP23017_REG_IODIRB, iodirb | MCP23017_POWER_ENCODER_B_MASK), TAG,
-                        "set MCP23017 IODIRB");
-
-    uint8_t gppub = 0;
-    if (mcp23017_read_reg(MCP23017_REG_GPPUB, &gppub) != ESP_OK) {
-        gppub = 0;
-    }
-    ESP_RETURN_ON_ERROR(mcp23017_write_reg(MCP23017_REG_GPPUB, gppub | MCP23017_POWER_ENCODER_B_MASK), TAG,
-                        "set MCP23017 GPPUB");
-
-    ESP_LOGI(TAG,
-             "MCP23017 encoder detected at 0x%02X, freq A=PA0 B=PA1 S=PA2 step=%lu Hz, power A=PA6 B=PA7 S=PB0 step=%d W",
-             addr, (unsigned long)ENCODER_STEP_HZ, POWER_ENCODER_STEP_W);
-    return ESP_OK;
+    ESP_RETURN_ON_ERROR(last_err, TAG, "configure MCP23017");
+    return ESP_ERR_NOT_FOUND;
 }
 
 static void encoder_task(void *arg)
@@ -960,6 +1014,10 @@ static void encoder_task(void *arg)
     if (mcp23017_read_reg(MCP23017_REG_GPIOA, &gpioa) == ESP_OK) {
         prev_freq_ab = gpioa & 0x03;
         prev_power_ab = (gpioa >> 6) & 0x03;
+    }
+    if (mcp23017_read_reg(MCP23017_REG_GPIOB, &gpiob) == ESP_OK) {
+        ESP_LOGI(TAG, "MCP23017 initial GPIOA=0x%02X GPIOB=0x%02X freq_ab=%u power_ab=%u", gpioa, gpiob,
+                 prev_freq_ab, prev_power_ab);
     }
 
     bool stable_freq_button = true;
@@ -1036,6 +1094,24 @@ static void encoder_task(void *arg)
             }
         }
         vTaskDelay(pdMS_TO_TICKS(3));
+    }
+}
+
+static void aux_oled_task(void *arg)
+{
+    (void)arg;
+    vTaskDelay(pdMS_TO_TICKS(500));
+
+    if (aux_oled_init() != ESP_OK) {
+        ESP_LOGW(TAG, "Aux OLED disabled; check TCA9548A/OLED wiring");
+        vTaskDelete(NULL);
+        return;
+    }
+
+    aux_oled_show_power(s_state.power_w, true);
+    while (true) {
+        aux_oled_show_power(s_state.power_w, false);
+        vTaskDelay(pdMS_TO_TICKS(100));
     }
 }
 
@@ -1298,7 +1374,6 @@ static void create_top_bar(lv_obj_t *scr, bool show_back)
 static void update_ui_locked(void)
 {
     update_top_bar_locked();
-    aux_oled_show_power(s_state.power_w, false);
     if (s_screen != SCREEN_MAIN) {
         if (s_screen == SCREEN_WIFI && s_wifi_page_status_label) {
             lv_label_set_text(s_wifi_conn_ssid_label, s_wifi_state == WIFI_STATE_ONLINE ? s_wifi_ssid : "--");
@@ -1993,18 +2068,14 @@ void app_controller_start(void)
     create_ui();
     bsp_display_unlock();
 
-    esp_err_t aux_err = aux_oled_init();
-    if (aux_err == ESP_OK) {
-        aux_oled_show_power(s_state.power_w, true);
-    } else {
-        ESP_LOGW(TAG, "Aux OLED disabled: %s", esp_err_to_name(aux_err));
-    }
-
     BaseType_t wifi_task_created = xTaskCreate(wifi_manager_task, "wifi_manager", 8192, NULL, 6, NULL);
     assert(wifi_task_created == pdTRUE);
 
     BaseType_t encoder_task_created = xTaskCreate(encoder_task, "encoder_task", 4096, NULL, 7, NULL);
     assert(encoder_task_created == pdTRUE);
+
+    BaseType_t aux_oled_task_created = xTaskCreate(aux_oled_task, "aux_oled", 4096, NULL, 4, NULL);
+    assert(aux_oled_task_created == pdTRUE);
 
     BaseType_t task_created = xTaskCreate(cat_task, "cat_task", 8192, NULL, 8, NULL);
     assert(task_created == pdTRUE);

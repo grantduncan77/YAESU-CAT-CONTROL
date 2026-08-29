@@ -15,6 +15,7 @@ The project builds a 7-inch landscape touch panel for controlling common FT-710 
 - Mode selection
 - Band default-frequency write
 - RF Power control
+- RF Power value mirrored to a 0.96-inch SSD1306 auxiliary OLED through TCA9548A channel 3
 - DNR on/off and level control
 - External EC11 encoder frequency and RF Power input through MCP23017 over I2C
 - CAT / BT / WiFi / RX status bar
@@ -57,7 +58,7 @@ Activate the local ESP-IDF environment:
 ## Repository Layout
 
 - `ft710_controller/`  
-  Current main firmware. Includes LVGL touch UI, CH9102 USB-TTL CAT transport, command queue, VFO/mode/power/DNR controls, WiFi setup page, soft keyboard, and time display.
+  Current main firmware. Includes LVGL touch UI, CH9102 USB-TTL CAT transport, command queue, VFO/mode/power/DNR controls, WiFi setup page, soft keyboard, time display, MCP23017 EC11 input, and the auxiliary SSD1306 RF Power display behind TCA9548A channel 3.
 
 - `ft710_ch9102_usb_probe/`  
   ESP32-P4 USB Host probe for the external CH9102 USB-TTL to FT-710 CAT-3 path.
@@ -115,6 +116,7 @@ Development and hardware tests have confirmed:
 - RF Power and DNR now use immediate local UI update plus CAT write and later readback correction.
 - MCP23017 + EC11 external encoders are detected over I2C. The frequency encoder adjusts the selected VFO input in 1 kHz steps and sends it on button press; the RF Power encoder sends `PCxxx;` in 1W steps.
 - Standalone OLED/Mux/encoder test works: TCA9548A detected at `0x70`, OLED detected at `0x3C` behind channel 3, MCP23017 detected at `0x27`, and rotating the RF Power encoder updates the 0.96-inch OLED power display in 1W steps.
+- Main firmware integration of the auxiliary OLED works at startup: `Aux OLED ready: TCA9548A=0x70 channel=3 SSD1306=0x3C`. The OLED follows the main `power_w` state, so touch power changes, encoder changes, and CAT readback corrections can update the small display.
 - Mode buttons now follow the selected A/B input target, so VFO-A sends `MD0x;` and VFO-B sends `MD1x;`.
 - WiFi setup page starts ESP-Hosted WiFi, scans 2.4 GHz APs, and presents a scrollable AP list.
 - Soft keyboard control keys were fixed: `CLEAR`, `BACK`, and `SPACE` now behave correctly.

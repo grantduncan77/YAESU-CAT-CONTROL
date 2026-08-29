@@ -23,6 +23,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
 #include "freertos/queue.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "lvgl.h"
 #include "nvs.h"
@@ -116,11 +117,20 @@ typedef struct {
 #define MCP23017_POWER_ENCODER_A_MASK (BIT(6) | BIT(7))
 #define MCP23017_POWER_ENCODER_B_MASK BIT(0)
 #define POWER_ENCODER_STEP_W 1
+#define AUX_OLED_I2C_HZ 100000
+#define AUX_OLED_WIDTH 128
+#define AUX_OLED_HEIGHT 64
+#define AUX_OLED_PAGES (AUX_OLED_HEIGHT / 8)
+#define AUX_OLED_ADDR_PRIMARY 0x3C
+#define AUX_OLED_ADDR_SECONDARY 0x3D
+#define TCA9548A_ADDR 0x70
+#define TCA9548A_OLED_CHANNEL 3
 
 static QueueHandle_t s_rx_queue;
 static QueueHandle_t s_cmd_queue;
 static QueueHandle_t s_wifi_cmd_queue;
 static EventGroupHandle_t s_wifi_event_group;
+static SemaphoreHandle_t s_i2c_mutex;
 static radio_state_t s_state;
 static char s_input[18];
 static char s_input_target_vfo = 'A';
@@ -143,6 +153,12 @@ static wifi_ap_item_t s_wifi_aps[WIFI_AP_MAX];
 static char s_wifi_ap_ids[WIFI_AP_MAX][6];
 static uint16_t s_wifi_ap_count;
 static i2c_master_dev_handle_t s_mcp23017_dev;
+static i2c_master_dev_handle_t s_tca9548a_dev;
+static i2c_master_dev_handle_t s_aux_oled_dev;
+static uint8_t s_aux_oled_frame[AUX_OLED_WIDTH * AUX_OLED_PAGES];
+static uint8_t s_aux_oled_addr;
+static bool s_aux_oled_ready;
+static uint8_t s_aux_oled_last_power = 0xFF;
 
 static lv_obj_t *s_cat_status;
 static lv_obj_t *s_bt_status;
@@ -542,6 +558,242 @@ static void set_input_from_hz(uint32_t hz)
              (unsigned long)(hz % 1000000U));
 }
 
+static bool i2c_take(TickType_t timeout)
+{
+    return !s_i2c_mutex || xSemaphoreTake(s_i2c_mutex, timeout) == pdTRUE;
+}
+
+static void i2c_give(void)
+{
+    if (s_i2c_mutex) {
+        xSemaphoreGive(s_i2c_mutex);
+    }
+}
+
+static esp_err_t aux_oled_select(void)
+{
+    if (!s_tca9548a_dev) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    const uint8_t mask = BIT(TCA9548A_OLED_CHANNEL);
+    return i2c_master_transmit(s_tca9548a_dev, &mask, 1, 1000);
+}
+
+static esp_err_t aux_oled_cmd(uint8_t cmd)
+{
+    const uint8_t data[2] = {0x00, cmd};
+    ESP_RETURN_ON_ERROR(aux_oled_select(), TAG, "select aux OLED channel");
+    return i2c_master_transmit(s_aux_oled_dev, data, sizeof(data), 1000);
+}
+
+static esp_err_t aux_oled_data(const uint8_t *data, size_t len)
+{
+    uint8_t line[1 + AUX_OLED_WIDTH] = {0x40};
+    while (len) {
+        const size_t chunk = len > AUX_OLED_WIDTH ? AUX_OLED_WIDTH : len;
+        memcpy(&line[1], data, chunk);
+        ESP_RETURN_ON_ERROR(aux_oled_select(), TAG, "select aux OLED channel");
+        ESP_RETURN_ON_ERROR(i2c_master_transmit(s_aux_oled_dev, line, chunk + 1, 1000), TAG, "aux OLED data");
+        data += chunk;
+        len -= chunk;
+    }
+    return ESP_OK;
+}
+
+static esp_err_t aux_oled_flush(void)
+{
+    for (uint8_t page = 0; page < AUX_OLED_PAGES; ++page) {
+        ESP_RETURN_ON_ERROR(aux_oled_cmd(0xB0 | page), TAG, "aux OLED page");
+        ESP_RETURN_ON_ERROR(aux_oled_cmd(0x00), TAG, "aux OLED low col");
+        ESP_RETURN_ON_ERROR(aux_oled_cmd(0x10), TAG, "aux OLED high col");
+        ESP_RETURN_ON_ERROR(aux_oled_data(&s_aux_oled_frame[page * AUX_OLED_WIDTH], AUX_OLED_WIDTH), TAG,
+                            "aux OLED flush");
+    }
+    return ESP_OK;
+}
+
+static esp_err_t aux_oled_ssd1306_init(void)
+{
+    const uint8_t init[] = {
+        0xAE, 0x20, 0x00, 0xB0, 0xC8, 0x00, 0x10, 0x40, 0x81, 0x7F, 0xA1, 0xA6,
+        0xA8, 0x3F, 0xA4, 0xD3, 0x00, 0xD5, 0x80, 0xD9, 0xF1, 0xDA, 0x12, 0xDB,
+        0x40, 0x8D, 0x14, 0xAF,
+    };
+    for (size_t i = 0; i < sizeof(init); ++i) {
+        ESP_RETURN_ON_ERROR(aux_oled_cmd(init[i]), TAG, "aux OLED init");
+    }
+    memset(s_aux_oled_frame, 0, sizeof(s_aux_oled_frame));
+    return aux_oled_flush();
+}
+
+static void aux_oled_pixel(int x, int y, bool on)
+{
+    if (x < 0 || x >= AUX_OLED_WIDTH || y < 0 || y >= AUX_OLED_HEIGHT) {
+        return;
+    }
+    uint8_t *byte = &s_aux_oled_frame[(y / 8) * AUX_OLED_WIDTH + x];
+    const uint8_t bit = BIT(y % 8);
+    if (on) {
+        *byte |= bit;
+    } else {
+        *byte &= (uint8_t)~bit;
+    }
+}
+
+static void aux_oled_rect(int x, int y, int w, int h, bool on)
+{
+    for (int i = 0; i < w; ++i) {
+        aux_oled_pixel(x + i, y, on);
+        aux_oled_pixel(x + i, y + h - 1, on);
+    }
+    for (int i = 0; i < h; ++i) {
+        aux_oled_pixel(x, y + i, on);
+        aux_oled_pixel(x + w - 1, y + i, on);
+    }
+}
+
+static const uint8_t *aux_oled_glyph(char c)
+{
+    static const uint8_t space[5] = {0, 0, 0, 0, 0};
+    static const uint8_t minus[5] = {0x08, 0x08, 0x08, 0x08, 0x08};
+    static const uint8_t dot[5] = {0, 0, 0x60, 0x60, 0};
+    static const uint8_t colon[5] = {0, 0x36, 0x36, 0, 0};
+    static const uint8_t digits[10][5] = {
+        {0x3E, 0x51, 0x49, 0x45, 0x3E}, {0x00, 0x42, 0x7F, 0x40, 0x00},
+        {0x42, 0x61, 0x51, 0x49, 0x46}, {0x21, 0x41, 0x45, 0x4B, 0x31},
+        {0x18, 0x14, 0x12, 0x7F, 0x10}, {0x27, 0x45, 0x45, 0x45, 0x39},
+        {0x3C, 0x4A, 0x49, 0x49, 0x30}, {0x01, 0x71, 0x09, 0x05, 0x03},
+        {0x36, 0x49, 0x49, 0x49, 0x36}, {0x06, 0x49, 0x49, 0x29, 0x1E},
+    };
+    static const uint8_t letters[26][5] = {
+        {0x7E, 0x11, 0x11, 0x11, 0x7E}, {0x7F, 0x49, 0x49, 0x49, 0x36},
+        {0x3E, 0x41, 0x41, 0x41, 0x22}, {0x7F, 0x41, 0x41, 0x22, 0x1C},
+        {0x7F, 0x49, 0x49, 0x49, 0x41}, {0x7F, 0x09, 0x09, 0x09, 0x01},
+        {0x3E, 0x41, 0x49, 0x49, 0x7A}, {0x7F, 0x08, 0x08, 0x08, 0x7F},
+        {0x00, 0x41, 0x7F, 0x41, 0x00}, {0x20, 0x40, 0x41, 0x3F, 0x01},
+        {0x7F, 0x08, 0x14, 0x22, 0x41}, {0x7F, 0x40, 0x40, 0x40, 0x40},
+        {0x7F, 0x02, 0x0C, 0x02, 0x7F}, {0x7F, 0x04, 0x08, 0x10, 0x7F},
+        {0x3E, 0x41, 0x41, 0x41, 0x3E}, {0x7F, 0x09, 0x09, 0x09, 0x06},
+        {0x3E, 0x41, 0x51, 0x21, 0x5E}, {0x7F, 0x09, 0x19, 0x29, 0x46},
+        {0x46, 0x49, 0x49, 0x49, 0x31}, {0x01, 0x01, 0x7F, 0x01, 0x01},
+        {0x3F, 0x40, 0x40, 0x40, 0x3F}, {0x1F, 0x20, 0x40, 0x20, 0x1F},
+        {0x3F, 0x40, 0x38, 0x40, 0x3F}, {0x63, 0x14, 0x08, 0x14, 0x63},
+        {0x07, 0x08, 0x70, 0x08, 0x07}, {0x61, 0x51, 0x49, 0x45, 0x43},
+    };
+
+    if (c == ' ') return space;
+    if (c == '-') return minus;
+    if (c == '.') return dot;
+    if (c == ':') return colon;
+    if (c >= '0' && c <= '9') return digits[c - '0'];
+    if (c >= 'a' && c <= 'z') c = (char)(c - 'a' + 'A');
+    if (c >= 'A' && c <= 'Z') return letters[c - 'A'];
+    return space;
+}
+
+static void aux_oled_char(int x, int y, char c, int scale)
+{
+    const uint8_t *g = aux_oled_glyph(c);
+    for (int col = 0; col < 5; ++col) {
+        for (int row = 0; row < 7; ++row) {
+            if (g[col] & BIT(row)) {
+                for (int sx = 0; sx < scale; ++sx) {
+                    for (int sy = 0; sy < scale; ++sy) {
+                        aux_oled_pixel(x + col * scale + sx, y + row * scale + sy, true);
+                    }
+                }
+            }
+        }
+    }
+}
+
+static void aux_oled_text(int x, int y, const char *text, int scale)
+{
+    while (*text) {
+        aux_oled_char(x, y, *text++, scale);
+        x += 6 * scale;
+    }
+}
+
+static void aux_oled_draw_power(uint8_t power_w)
+{
+    memset(s_aux_oled_frame, 0, sizeof(s_aux_oled_frame));
+    aux_oled_rect(0, 0, AUX_OLED_WIDTH, AUX_OLED_HEIGHT, true);
+    aux_oled_text(6, 4, "RF POWER", 1);
+    aux_oled_text(6, 54, "FT-710", 1);
+
+    char value[8] = {};
+    snprintf(value, sizeof(value), "%uW", power_w);
+    const int scale = power_w >= 100 ? 4 : 5;
+    const int width = (int)strlen(value) * 6 * scale - scale;
+    aux_oled_text((AUX_OLED_WIDTH - width) / 2, 20, value, scale);
+}
+
+static void aux_oled_show_power(uint8_t power_w, bool force)
+{
+    if (!s_aux_oled_ready || (!force && s_aux_oled_last_power == power_w) || !i2c_take(pdMS_TO_TICKS(50))) {
+        return;
+    }
+    aux_oled_draw_power(power_w);
+    const esp_err_t err = aux_oled_flush();
+    if (err == ESP_OK) {
+        s_aux_oled_last_power = power_w;
+    } else {
+        ESP_LOGW(TAG, "Aux OLED power update failed: %s", esp_err_to_name(err));
+    }
+    i2c_give();
+}
+
+static esp_err_t aux_oled_init(void)
+{
+    ESP_RETURN_ON_ERROR(bsp_i2c_init(), TAG, "init BSP I2C for aux OLED");
+    i2c_master_bus_handle_t bus = bsp_i2c_get_handle();
+    ESP_RETURN_ON_FALSE(bus, ESP_FAIL, TAG, "BSP I2C handle is null");
+
+    if (!i2c_take(pdMS_TO_TICKS(500))) {
+        return ESP_ERR_TIMEOUT;
+    }
+
+    esp_err_t ret = i2c_master_probe(bus, TCA9548A_ADDR, 100);
+    if (ret != ESP_OK) {
+        i2c_give();
+        return ret;
+    }
+    const i2c_device_config_t tca_cfg = {
+        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+        .device_address = TCA9548A_ADDR,
+        .scl_speed_hz = AUX_OLED_I2C_HZ,
+    };
+    ESP_GOTO_ON_ERROR(i2c_master_bus_add_device(bus, &tca_cfg, &s_tca9548a_dev), cleanup, TAG, "add TCA9548A");
+    ESP_GOTO_ON_ERROR(aux_oled_select(), cleanup, TAG, "select aux OLED channel");
+
+    uint8_t addr = 0;
+    if (i2c_master_probe(bus, AUX_OLED_ADDR_PRIMARY, 100) == ESP_OK) {
+        addr = AUX_OLED_ADDR_PRIMARY;
+    } else if (i2c_master_probe(bus, AUX_OLED_ADDR_SECONDARY, 100) == ESP_OK) {
+        addr = AUX_OLED_ADDR_SECONDARY;
+    }
+    ESP_GOTO_ON_FALSE(addr != 0, ESP_ERR_NOT_FOUND, cleanup, TAG, "SSD1306 not found on TCA9548A channel %d",
+                      TCA9548A_OLED_CHANNEL);
+
+    const i2c_device_config_t oled_cfg = {
+        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+        .device_address = addr,
+        .scl_speed_hz = AUX_OLED_I2C_HZ,
+    };
+    ESP_GOTO_ON_ERROR(i2c_master_bus_add_device(bus, &oled_cfg, &s_aux_oled_dev), cleanup, TAG, "add aux OLED");
+    ESP_GOTO_ON_ERROR(aux_oled_ssd1306_init(), cleanup, TAG, "init aux OLED");
+
+    s_aux_oled_addr = addr;
+    s_aux_oled_ready = true;
+    ESP_LOGI(TAG, "Aux OLED ready: TCA9548A=0x%02X channel=%d SSD1306=0x%02X", TCA9548A_ADDR,
+             TCA9548A_OLED_CHANNEL, s_aux_oled_addr);
+
+cleanup:
+    i2c_give();
+    return ret;
+}
+
 static bool submit_input_frequency(void)
 {
     uint32_t hz = 0;
@@ -616,12 +868,22 @@ static void encoder_adjust_power(int delta)
 static esp_err_t mcp23017_write_reg(uint8_t reg, uint8_t value)
 {
     uint8_t data[2] = {reg, value};
-    return i2c_master_transmit(s_mcp23017_dev, data, sizeof(data), 50);
+    if (!i2c_take(pdMS_TO_TICKS(50))) {
+        return ESP_ERR_TIMEOUT;
+    }
+    const esp_err_t err = i2c_master_transmit(s_mcp23017_dev, data, sizeof(data), 50);
+    i2c_give();
+    return err;
 }
 
 static esp_err_t mcp23017_read_reg(uint8_t reg, uint8_t *value)
 {
-    return i2c_master_transmit_receive(s_mcp23017_dev, &reg, 1, value, 1, 50);
+    if (!i2c_take(pdMS_TO_TICKS(50))) {
+        return ESP_ERR_TIMEOUT;
+    }
+    const esp_err_t err = i2c_master_transmit_receive(s_mcp23017_dev, &reg, 1, value, 1, 50);
+    i2c_give();
+    return err;
 }
 
 static esp_err_t encoder_mcp23017_init(void)
@@ -1036,6 +1298,7 @@ static void create_top_bar(lv_obj_t *scr, bool show_back)
 static void update_ui_locked(void)
 {
     update_top_bar_locked();
+    aux_oled_show_power(s_state.power_w, false);
     if (s_screen != SCREEN_MAIN) {
         if (s_screen == SCREEN_WIFI && s_wifi_page_status_label) {
             lv_label_set_text(s_wifi_conn_ssid_label, s_wifi_state == WIFI_STATE_ONLINE ? s_wifi_ssid : "--");
@@ -1709,7 +1972,8 @@ void app_controller_start(void)
     s_rx_queue = xQueueCreate(512, sizeof(rx_byte_t));
     s_cmd_queue = xQueueCreate(16, sizeof(app_cmd_t));
     s_wifi_cmd_queue = xQueueCreate(8, sizeof(wifi_cmd_t));
-    assert(s_rx_queue && s_cmd_queue && s_wifi_cmd_queue);
+    s_i2c_mutex = xSemaphoreCreateMutex();
+    assert(s_rx_queue && s_cmd_queue && s_wifi_cmd_queue && s_i2c_mutex);
 
     bsp_display_cfg_t cfg = {
         .lv_adapter_cfg = ESP_LV_ADAPTER_DEFAULT_CONFIG(),
@@ -1728,6 +1992,13 @@ void app_controller_start(void)
     ESP_ERROR_CHECK(bsp_display_lock(-1) ? ESP_OK : ESP_ERR_TIMEOUT);
     create_ui();
     bsp_display_unlock();
+
+    esp_err_t aux_err = aux_oled_init();
+    if (aux_err == ESP_OK) {
+        aux_oled_show_power(s_state.power_w, true);
+    } else {
+        ESP_LOGW(TAG, "Aux OLED disabled: %s", esp_err_to_name(aux_err));
+    }
 
     BaseType_t wifi_task_created = xTaskCreate(wifi_manager_task, "wifi_manager", 8192, NULL, 6, NULL);
     assert(wifi_task_created == pdTRUE);

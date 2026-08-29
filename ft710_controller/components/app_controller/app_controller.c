@@ -3,6 +3,7 @@
 #include <assert.h>
 #include <ctype.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -10,6 +11,7 @@
 
 #include "bsp/display.h"
 #include "bsp/esp-bsp.h"
+#include "driver/i2c_master.h"
 #include "esp_check.h"
 #include "esp_err.h"
 #include "esp_event.h"
@@ -101,6 +103,19 @@ typedef struct {
 } wifi_ap_item_t;
 
 #define WIFI_AP_MAX 16
+#define ENCODER_STEP_HZ 1000U
+#define MCP23017_ADDR_MIN 0x20
+#define MCP23017_ADDR_MAX 0x27
+#define MCP23017_REG_IODIRA 0x00
+#define MCP23017_REG_IODIRB 0x01
+#define MCP23017_REG_GPPUA 0x0C
+#define MCP23017_REG_GPPUB 0x0D
+#define MCP23017_REG_GPIOA 0x12
+#define MCP23017_REG_GPIOB 0x13
+#define MCP23017_FREQ_ENCODER_MASK 0x07
+#define MCP23017_POWER_ENCODER_A_MASK (BIT(6) | BIT(7))
+#define MCP23017_POWER_ENCODER_B_MASK BIT(0)
+#define POWER_ENCODER_STEP_W 1
 
 static QueueHandle_t s_rx_queue;
 static QueueHandle_t s_cmd_queue;
@@ -127,6 +142,7 @@ static char s_wifi_dns[16] = "--.--.--.--";
 static wifi_ap_item_t s_wifi_aps[WIFI_AP_MAX];
 static char s_wifi_ap_ids[WIFI_AP_MAX][6];
 static uint16_t s_wifi_ap_count;
+static i2c_master_dev_handle_t s_mcp23017_dev;
 
 static lv_obj_t *s_cat_status;
 static lv_obj_t *s_bt_status;
@@ -505,6 +521,262 @@ static void send_cmd(const app_cmd_t *cmd)
     xQueueSend(s_cmd_queue, cmd, 0);
 }
 
+static void update_input_hint_locked(void)
+{
+    if (!s_input_hint) {
+        return;
+    }
+    char buf[40] = {};
+    snprintf(buf, sizeof(buf), "%c  %s", s_input_target_vfo, s_input[0] ? s_input : "--.---");
+    lv_label_set_text(s_input_hint, buf);
+}
+
+static uint32_t selected_input_vfo_hz(void)
+{
+    return s_input_target_vfo == 'B' ? s_state.vfo_b_hz : s_state.vfo_a_hz;
+}
+
+static void set_input_from_hz(uint32_t hz)
+{
+    snprintf(s_input, sizeof(s_input), "%lu.%06lu", (unsigned long)(hz / 1000000U),
+             (unsigned long)(hz % 1000000U));
+}
+
+static bool submit_input_frequency(void)
+{
+    uint32_t hz = 0;
+    if (!parse_input_hz(&hz)) {
+        return false;
+    }
+
+    const app_cmd_t cmd = {
+        .type = CMD_SET_FREQ,
+        .vfo = s_input_target_vfo,
+        .hz = hz,
+    };
+    send_cmd(&cmd);
+    s_input[0] = '\0';
+    return true;
+}
+
+static void encoder_adjust_input(int delta)
+{
+    if (s_screen != SCREEN_MAIN || delta == 0) {
+        return;
+    }
+
+    uint32_t hz = 0;
+    if (!parse_input_hz(&hz)) {
+        hz = selected_input_vfo_hz();
+    }
+
+    int64_t next = (int64_t)hz + (int64_t)delta * ENCODER_STEP_HZ;
+    if (next < 1000) {
+        next = 1000;
+    } else if (next > 999999999) {
+        next = 999999999;
+    }
+    set_input_from_hz((uint32_t)next);
+
+    if (bsp_display_lock(pdMS_TO_TICKS(50))) {
+        update_input_hint_locked();
+        bsp_display_unlock();
+    }
+}
+
+static void encoder_adjust_power(int delta)
+{
+    if (s_screen != SCREEN_MAIN || delta == 0) {
+        return;
+    }
+
+    int p = (int)s_state.power_w + delta * POWER_ENCODER_STEP_W;
+    if (p < 5) {
+        p = 5;
+    } else if (p > 100) {
+        p = 100;
+    }
+    if (p == (int)s_state.power_w) {
+        return;
+    }
+
+    s_state.power_w = (uint8_t)p;
+    const app_cmd_t cmd = {
+        .type = CMD_SET_POWER,
+        .value = (uint8_t)p,
+    };
+    send_cmd(&cmd);
+
+    if (bsp_display_lock(pdMS_TO_TICKS(50))) {
+        update_ui_locked();
+        bsp_display_unlock();
+    }
+}
+
+static esp_err_t mcp23017_write_reg(uint8_t reg, uint8_t value)
+{
+    uint8_t data[2] = {reg, value};
+    return i2c_master_transmit(s_mcp23017_dev, data, sizeof(data), 50);
+}
+
+static esp_err_t mcp23017_read_reg(uint8_t reg, uint8_t *value)
+{
+    return i2c_master_transmit_receive(s_mcp23017_dev, &reg, 1, value, 1, 50);
+}
+
+static esp_err_t encoder_mcp23017_init(void)
+{
+    ESP_RETURN_ON_ERROR(bsp_i2c_init(), TAG, "init BSP I2C");
+    i2c_master_bus_handle_t bus = bsp_i2c_get_handle();
+    ESP_RETURN_ON_FALSE(bus, ESP_FAIL, TAG, "BSP I2C handle is null");
+
+    uint8_t addr = 0;
+    for (uint8_t candidate = MCP23017_ADDR_MIN; candidate <= MCP23017_ADDR_MAX; ++candidate) {
+        if (i2c_master_probe(bus, candidate, 100) == ESP_OK) {
+            addr = candidate;
+            break;
+        }
+    }
+    ESP_RETURN_ON_FALSE(addr != 0, ESP_ERR_NOT_FOUND, TAG, "MCP23017 not found on I2C");
+
+    i2c_device_config_t dev_cfg = {
+        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+        .device_address = addr,
+        .scl_speed_hz = CONFIG_BSP_I2C_CLK_SPEED_HZ,
+    };
+    ESP_RETURN_ON_ERROR(i2c_master_bus_add_device(bus, &dev_cfg, &s_mcp23017_dev), TAG, "add MCP23017");
+
+    uint8_t iodira = 0xFF;
+    if (mcp23017_read_reg(MCP23017_REG_IODIRA, &iodira) != ESP_OK) {
+        iodira = 0xFF;
+    }
+    ESP_RETURN_ON_ERROR(mcp23017_write_reg(MCP23017_REG_IODIRA, iodira | MCP23017_FREQ_ENCODER_MASK |
+                                                                  MCP23017_POWER_ENCODER_A_MASK), TAG,
+                        "set MCP23017 IODIRA");
+
+    uint8_t gppua = 0;
+    if (mcp23017_read_reg(MCP23017_REG_GPPUA, &gppua) != ESP_OK) {
+        gppua = 0;
+    }
+    ESP_RETURN_ON_ERROR(mcp23017_write_reg(MCP23017_REG_GPPUA, gppua | MCP23017_FREQ_ENCODER_MASK |
+                                                                  MCP23017_POWER_ENCODER_A_MASK), TAG,
+                        "set MCP23017 GPPUA");
+
+    uint8_t iodirb = 0xFF;
+    if (mcp23017_read_reg(MCP23017_REG_IODIRB, &iodirb) != ESP_OK) {
+        iodirb = 0xFF;
+    }
+    ESP_RETURN_ON_ERROR(mcp23017_write_reg(MCP23017_REG_IODIRB, iodirb | MCP23017_POWER_ENCODER_B_MASK), TAG,
+                        "set MCP23017 IODIRB");
+
+    uint8_t gppub = 0;
+    if (mcp23017_read_reg(MCP23017_REG_GPPUB, &gppub) != ESP_OK) {
+        gppub = 0;
+    }
+    ESP_RETURN_ON_ERROR(mcp23017_write_reg(MCP23017_REG_GPPUB, gppub | MCP23017_POWER_ENCODER_B_MASK), TAG,
+                        "set MCP23017 GPPUB");
+
+    ESP_LOGI(TAG,
+             "MCP23017 encoder detected at 0x%02X, freq A=PA0 B=PA1 S=PA2 step=%lu Hz, power A=PA6 B=PA7 S=PB0 step=%d W",
+             addr, (unsigned long)ENCODER_STEP_HZ, POWER_ENCODER_STEP_W);
+    return ESP_OK;
+}
+
+static void encoder_task(void *arg)
+{
+    (void)arg;
+    if (encoder_mcp23017_init() != ESP_OK) {
+        ESP_LOGW(TAG, "External encoder disabled; check I2C wiring and MCP23017 address jumpers");
+        vTaskDelete(NULL);
+        return;
+    }
+
+    uint8_t gpioa = 0xFF;
+    uint8_t gpiob = 0xFF;
+    uint8_t prev_freq_ab = 0x03;
+    uint8_t prev_power_ab = 0x03;
+    if (mcp23017_read_reg(MCP23017_REG_GPIOA, &gpioa) == ESP_OK) {
+        prev_freq_ab = gpioa & 0x03;
+        prev_power_ab = (gpioa >> 6) & 0x03;
+    }
+
+    bool stable_freq_button = true;
+    bool last_freq_button_sample = true;
+    bool stable_power_button = true;
+    bool last_power_button_sample = true;
+    TickType_t last_freq_button_change = xTaskGetTickCount();
+    TickType_t last_power_button_change = xTaskGetTickCount();
+    int8_t freq_quad_accum = 0;
+    int8_t power_quad_accum = 0;
+    const int8_t quad_table[16] = {
+        0, -1, 1, 0,
+        1, 0, 0, -1,
+        -1, 0, 0, 1,
+        0, 1, -1, 0,
+    };
+
+    while (true) {
+        if (mcp23017_read_reg(MCP23017_REG_GPIOA, &gpioa) == ESP_OK) {
+            const uint8_t freq_ab = gpioa & 0x03;
+            if (freq_ab != prev_freq_ab) {
+                freq_quad_accum += quad_table[(prev_freq_ab << 2) | freq_ab];
+                prev_freq_ab = freq_ab;
+                if (freq_quad_accum >= 4) {
+                    encoder_adjust_input(1);
+                    freq_quad_accum = 0;
+                } else if (freq_quad_accum <= -4) {
+                    encoder_adjust_input(-1);
+                    freq_quad_accum = 0;
+                }
+            }
+
+            const uint8_t power_ab = (gpioa >> 6) & 0x03;
+            if (power_ab != prev_power_ab) {
+                power_quad_accum += quad_table[(prev_power_ab << 2) | power_ab];
+                prev_power_ab = power_ab;
+                if (power_quad_accum >= 4) {
+                    encoder_adjust_power(1);
+                    power_quad_accum = 0;
+                } else if (power_quad_accum <= -4) {
+                    encoder_adjust_power(-1);
+                    power_quad_accum = 0;
+                }
+            }
+
+            const bool freq_button_released = (gpioa & BIT(2)) != 0;
+            const TickType_t now = xTaskGetTickCount();
+            if (freq_button_released != last_freq_button_sample) {
+                last_freq_button_sample = freq_button_released;
+                last_freq_button_change = now;
+            }
+            if ((now - last_freq_button_change) >= pdMS_TO_TICKS(35) &&
+                freq_button_released != stable_freq_button) {
+                stable_freq_button = freq_button_released;
+                if (!stable_freq_button && s_screen == SCREEN_MAIN) {
+                    submit_input_frequency();
+                    if (bsp_display_lock(pdMS_TO_TICKS(50))) {
+                        update_input_hint_locked();
+                        bsp_display_unlock();
+                    }
+                }
+            }
+        }
+        if (mcp23017_read_reg(MCP23017_REG_GPIOB, &gpiob) == ESP_OK) {
+            const bool power_button_released = (gpiob & BIT(0)) != 0;
+            const TickType_t now = xTaskGetTickCount();
+            if (power_button_released != last_power_button_sample) {
+                last_power_button_sample = power_button_released;
+                last_power_button_change = now;
+            }
+            if ((now - last_power_button_change) >= pdMS_TO_TICKS(35) &&
+                power_button_released != stable_power_button) {
+                stable_power_button = power_button_released;
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(3));
+    }
+}
+
 static void button_event_cb(lv_event_t *e)
 {
     const char *id = (const char *)lv_event_get_user_data(e);
@@ -611,14 +883,7 @@ static void button_event_cb(lv_event_t *e)
     } else if (strcmp(id, "TARGET_B") == 0) {
         s_input_target_vfo = 'B';
     } else if (strcmp(id, "SET") == 0) {
-        uint32_t hz = 0;
-        if (parse_input_hz(&hz)) {
-            cmd.type = CMD_SET_FREQ;
-            cmd.vfo = s_input_target_vfo;
-            cmd.hz = hz;
-            send_cmd(&cmd);
-            s_input[0] = '\0';
-        }
+        submit_input_frequency();
     } else if (strcmp(id, "AB") == 0) {
         cmd.type = CMD_SELECT_MAIN_VFO;
         cmd.vfo = s_state.active_vfo == 'A' ? 'B' : 'A';
@@ -655,7 +920,7 @@ static void button_event_cb(lv_event_t *e)
         else if (strcmp(id, "M_FM") == 0) cmd.mode = FT710_MODE_FM;
         else if (strcmp(id, "M_AM") == 0) cmd.mode = FT710_MODE_AM;
         else cmd.mode = FT710_MODE_DATA_U;
-        cmd.vfo = s_state.active_vfo;
+        cmd.vfo = s_input_target_vfo;
         if (cmd.vfo == 'B') {
             s_state.mode_b = cmd.mode;
         } else {
@@ -675,9 +940,7 @@ static void button_event_cb(lv_event_t *e)
     }
 
     if (bsp_display_lock(pdMS_TO_TICKS(50))) {
-        char buf[40] = {};
-        snprintf(buf, sizeof(buf), "%c  %s", s_input_target_vfo, s_input[0] ? s_input : "--.---");
-        lv_label_set_text(s_input_hint, buf);
+        update_input_hint_locked();
         update_ui_locked();
         bsp_display_unlock();
     }
@@ -822,7 +1085,7 @@ static void update_ui_locked(void)
     set_button_active(s_power_step_btns[1], s_power_step == 5);
     set_button_active(s_power_step_btns[2], s_power_step == 10);
 
-    ft710_mode_t active_mode = s_state.active_vfo == 'B' ? s_state.mode_b : s_state.mode_a;
+    ft710_mode_t active_mode = s_input_target_vfo == 'B' ? s_state.mode_b : s_state.mode_a;
     const ft710_mode_t modes[5] = {FT710_MODE_LSB, FT710_MODE_USB, FT710_MODE_FM, FT710_MODE_AM, FT710_MODE_DATA_U};
     for (int i = 0; i < 5; ++i) {
         set_button_active(s_mode_btns[i], active_mode == modes[i]);
@@ -1468,6 +1731,9 @@ void app_controller_start(void)
 
     BaseType_t wifi_task_created = xTaskCreate(wifi_manager_task, "wifi_manager", 8192, NULL, 6, NULL);
     assert(wifi_task_created == pdTRUE);
+
+    BaseType_t encoder_task_created = xTaskCreate(encoder_task, "encoder_task", 4096, NULL, 7, NULL);
+    assert(encoder_task_created == pdTRUE);
 
     BaseType_t task_created = xTaskCreate(cat_task, "cat_task", 8192, NULL, 8, NULL);
     assert(task_created == pdTRUE);

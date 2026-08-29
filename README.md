@@ -16,6 +16,7 @@ The project builds a 7-inch landscape touch panel for controlling common FT-710 
 - Band default-frequency write
 - RF Power control
 - DNR on/off and level control
+- External EC11 encoder frequency and RF Power input through MCP23017 over I2C
 - CAT / BT / WiFi / RX status bar
 - WiFi setup page
 - Network time display with local / UTC toggle
@@ -30,6 +31,9 @@ The first version intentionally does not implement PTT or transmit control.
 - MCU: ESP32-P4
 - Wireless coprocessor: onboard ESP32-C6
 - Current CAT link: ESP32-P4 USB Host -> external CH9102 USB-TTL -> FT-710 CAT-3 TTL UART
+- Optional input: EC11 rotary encoders with buttons -> Waveshare MCP23017 I/O expander -> ESP32-P4 I2C
+
+The current EC11 test wiring is: frequency encoder A -> MCP23017 PA0, B -> PA1, S/button -> PA2; RF Power encoder A -> PA6, B -> PA7, S/button -> PB0. The firmware enables MCP23017 pull-ups on those inputs and auto-scans I2C addresses `0x20` through `0x27`; the tested Waveshare module was detected at `0x27`.
 
 The FT-710 rear USB direct CP2105 route was tested, but ESP-IDF v5.5.5 currently cannot enumerate the FT-710 downstream CP2105 through the radio's USB hub because the required Hub TT path is not supported for this use case. The first working route is therefore the external CH9102 USB-TTL adapter connected to the FT-710 CAT-3 port.
 
@@ -103,6 +107,8 @@ Development and hardware tests have confirmed:
 - Dual VFO frequency polling around 100 ms is usable.
 - Main control UI runs on the 1024 x 600 touch screen.
 - RF Power and DNR now use immediate local UI update plus CAT write and later readback correction.
+- MCP23017 + EC11 external encoders are detected over I2C. The frequency encoder adjusts the selected VFO input in 1 kHz steps and sends it on button press; the RF Power encoder sends `PCxxx;` in 1W steps.
+- Mode buttons now follow the selected A/B input target, so VFO-A sends `MD0x;` and VFO-B sends `MD1x;`.
 - WiFi setup page starts ESP-Hosted WiFi, scans 2.4 GHz APs, and presents a scrollable AP list.
 - Soft keyboard control keys were fixed: `CLEAR`, `BACK`, and `SPACE` now behave correctly.
 
@@ -160,6 +166,7 @@ The first version is deliberately conservative:
 
 - `ft710_controller/components/app_controller/app_controller.c` currently contains UI, CAT, WiFi, time, and state logic together. It should be split into smaller modules.
 - CH9102 hotplug and reconnect handling needs more work.
+- EC11 direction, step size, and optional button shortcuts may need final operator tuning after longer hands-on use.
 - WiFi connection failure handling, saved credential UX, and reconnect flow need more polish.
 - AP scan cache currently stores a limited number of AP entries.
 - FT-710 rear USB direct CP2105 remains blocked by the Hub/TT path in the tested ESP-IDF stack.
@@ -184,6 +191,7 @@ Planned refactor:
 Test priorities:
 
 - CH9102 reconnect and hotplug
+- EC11 long-press / step-size / VFO target shortcuts
 - WiFi connect/disconnect/reconnect
 - 30-minute and longer stability tests
 - pending/confirmed CAT command UI state

@@ -17,7 +17,8 @@ The project builds a 7-inch landscape touch panel for controlling common FT-710 
 - RF Power control
 - RF Power value mirrored to a 0.96-inch SSD1306 auxiliary OLED through TCA9548A channel 3
 - DNR on/off and level control
-- External EC11 encoder frequency and RF Power input through MCP23017 over I2C
+- External EC11 encoder inputs for frequency, RF Power, DNR, and WIDTH through MCP23017 over I2C
+- Three auxiliary SSD1306 OLED displays for WIDTH, RF Power, and DNR through TCA9548A
 - CAT / BT / WiFi / RX status bar
 - WiFi setup page
 - Network time display with local / UTC toggle
@@ -33,11 +34,18 @@ The first version intentionally does not implement PTT or transmit control.
 - Wireless coprocessor: onboard ESP32-C6
 - Current CAT link: ESP32-P4 USB Host -> external CH9102 USB-TTL -> FT-710 CAT-3 TTL UART
 - Optional input: EC11 rotary encoders with buttons -> Waveshare MCP23017 I/O expander -> ESP32-P4 I2C
-- Auxiliary test display: 0.96-inch 128 x 64 SSD1306 I2C OLED through a Qwiic Mux Breakout TCA9548A, channel 3
+- Auxiliary displays: 0.96-inch 128 x 64 SSD1306 I2C OLEDs through a Qwiic Mux Breakout TCA9548A
 
-The current EC11 test wiring is: frequency encoder A -> MCP23017 PA0, B -> PA1, S/button -> PA2; RF Power encoder A -> PA6, B -> PA7, S/button -> PB0. The firmware enables MCP23017 pull-ups on those inputs, uses 100 kHz I2C for the auxiliary I2C devices, prioritizes the tested MCP23017 address `0x27`, and only accepts an address after the MCP23017 registers can be configured successfully.
+The current EC11 wiring is:
 
-The current OLED/Mux test wiring is: ESP32-P4 I2C1 `SDA=GPIO7`, `SCL=GPIO8`; TCA9548A default address `0x70`; SSD1306 OLED on mux channel 3, detected at `0x3C`.
+- Frequency encoder: A -> MCP23017 PA0, B -> PA1, S/button -> PA2
+- RF Power encoder: A -> PA6, B -> PA7, S/button -> PB0
+- DNR encoder: A -> PA3, B -> PA4, S/button -> PA5
+- WIDTH encoder: A -> PB7, B -> PB6, S/button -> PB5
+
+The firmware enables MCP23017 pull-ups on those inputs, uses 100 kHz I2C for the auxiliary I2C devices, prioritizes the tested MCP23017 address `0x27`, and only accepts an address after the MCP23017 registers can be configured successfully.
+
+The current OLED/Mux wiring is: ESP32-P4 I2C1 `SDA=GPIO7`, `SCL=GPIO8`; TCA9548A default address `0x70`; SSD1306 OLED address `0x3C`. Channel 2 is WIDTH, channel 3 is RF Power, and channel 4 is DNR.
 
 The FT-710 rear USB direct CP2105 route was tested, but ESP-IDF v5.5.5 currently cannot enumerate the FT-710 downstream CP2105 through the radio's USB hub because the required Hub TT path is not supported for this use case. The first working route is therefore the external CH9102 USB-TTL adapter connected to the FT-710 CAT-3 port.
 
@@ -58,7 +66,7 @@ Activate the local ESP-IDF environment:
 ## Repository Layout
 
 - `ft710_controller/`  
-  Current main firmware. Includes LVGL touch UI, CH9102 USB-TTL CAT transport, command queue, VFO/mode/power/DNR controls, WiFi setup page, soft keyboard, time display, MCP23017 EC11 input, and the auxiliary SSD1306 RF Power display behind TCA9548A channel 3.
+  Current main firmware. Includes LVGL touch UI, CH9102 USB-TTL CAT transport, command queue, VFO/mode/power/DNR/WIDTH controls, WiFi setup page, soft keyboard, time display, MCP23017 EC11 input, and auxiliary SSD1306 displays behind TCA9548A channels 2/3/4.
 
 - `ft710_ch9102_usb_probe/`  
   ESP32-P4 USB Host probe for the external CH9102 USB-TTL to FT-710 CAT-3 path.
@@ -75,6 +83,15 @@ Activate the local ESP-IDF environment:
 - `oled_i2c_test/`  
   Standalone ESP-IDF test for the 0.96-inch SSD1306 OLED and MCP23017 RF Power encoder over the ESP32-P4 I2C bus. It selects TCA9548A channel 3 for the OLED and shows the power value in large text while the RF Power EC11 is rotated.
 
+- `esp32_devkitc_tests/`  
+  ESP32-DevKitC-32E WiFi/BLE/CAT bridge experiments. This includes the earlier WiFi scan and BLE UART validation work, plus the CAT-3 wireless bridge prototype. The DevKitC bridge phase is currently paused because the user reported hardware trouble.
+
+- `esp32_c6_hosted_slave_recovery_20260830/`  
+  ESP-Hosted slave recovery/reference work used while restoring the ESP32-P4 board's onboard ESP32-C6 WiFi path.
+
+- `docs/obsidian/`  
+  Snapshot of the Obsidian project notes, including planning, test logs, UI decisions, wiring notes, screenshots, and the latest 2026-08-30/31 external encoder and OLED record.
+
 ## Build And Flash
 
 Build the main firmware:
@@ -82,19 +99,19 @@ Build the main firmware:
 ```powershell
 . "D:\CAT CONTROL\idf-v5.5.5.ps1"
 cd "D:\CAT CONTROL\ft710_controller"
-idf.py build
+idf.py -B build_v555 build
 ```
 
 Flash to the ESP32-P4 board:
 
 ```powershell
-idf.py -p COM4 flash
+idf.py -B build_v555 -p COM4 flash
 ```
 
 Optional monitor:
 
 ```powershell
-idf.py -p COM4 monitor
+idf.py -B build_v555 -p COM4 monitor
 ```
 
 `build/` and normal ESP-IDF `managed_components/` directories are intentionally ignored. Dependencies are restored by ESP-IDF from `idf_component.yml` and `dependencies.lock`.
@@ -114,11 +131,14 @@ Development and hardware tests have confirmed:
 - Dual VFO frequency polling around 100 ms is usable.
 - Main control UI runs on the 1024 x 600 touch screen.
 - RF Power and DNR now use immediate local UI update plus CAT write and later readback correction.
-- MCP23017 + EC11 external encoders are detected over I2C at the verified `0x27` address. The frequency encoder adjusts the selected VFO input in 1 kHz steps and sends it on button press; the RF Power encoder sends `PCxxx;` in 1W steps and is available globally.
+- MCP23017 + EC11 external encoders are detected over I2C at the verified `0x27` address. The frequency encoder adjusts the selected VFO input in 1 kHz steps and sends it on button press; the RF Power encoder is globally available and supports selectable `2W/5W/10W` steps from its push button; the DNR encoder adjusts DNR and its button turns DNR off; the WIDTH encoder adjusts `SH00xx;` and its button sends the WIDTH default.
 - Standalone OLED/Mux/encoder test works: TCA9548A detected at `0x70`, OLED detected at `0x3C` behind channel 3, MCP23017 detected at `0x27`, and rotating the RF Power encoder updates the 0.96-inch OLED power display in 1W steps.
-- Main firmware integration of the auxiliary OLED works at startup: `Aux OLED ready: TCA9548A=0x70 channel=3 SSD1306=0x3C`. The OLED follows the main `power_w` state from a background task, so touch power changes, encoder changes, and CAT readback corrections can update the small display without blocking UI refresh.
+- Main firmware integration of the auxiliary OLEDs works at startup: `Aux OLED ready: TCA9548A=0x70 channel=2/3/4 SSD1306=0x3C`. The OLEDs follow the main state from a background task, so touch changes, encoder changes, and CAT readback corrections can update the small displays without blocking UI refresh.
 - Main firmware RF Power encoder verification after the OLED integration fix: `Power encoder set 14W..18W` and CAT `PC014..PC018` all returned `ESP_OK`.
 - Mode buttons now follow the selected A/B input target, so VFO-A sends `MD0x;` and VFO-B sends `MD1x;`.
+- WIDTH display now maps the FT-710 `SH` index to actual bandwidth values. `00` is shown as `DEF`; valid mode-specific values show Hz numbers such as `400`, `800`, or `3500`; invalid mode/index combinations show `---`.
+- WIDTH OLED rendering now uses a variable trapezoid, extended bottom baseline, cross-hatched fill, and larger mapped Hz text below the baseline.
+- RF Power OLED rendering now uses a smaller upper power readout plus a bottom `5-100W` progress bar. DNR and RF Power OLEDs no longer show the old lower-left `FT-710` label.
 - WiFi setup page starts ESP-Hosted WiFi, scans 2.4 GHz APs, and presents a scrollable AP list.
 - Soft keyboard control keys were fixed: `CLEAR`, `BACK`, and `SPACE` now behave correctly.
 
@@ -181,6 +201,7 @@ The first version is deliberately conservative:
 - AP scan cache currently stores a limited number of AP entries.
 - FT-710 rear USB direct CP2105 remains blocked by the Hub/TT path in the tested ESP-IDF stack.
 - Band buttons currently write project-defined default frequencies, not FT-710 Band Stack entries.
+- The DevKitC BLE/WiFi CAT bridge prototype is paused pending hardware recovery or replacement.
 - Long-duration stability and RF-environment testing still need to be completed.
 
 ## Suggested Next Steps

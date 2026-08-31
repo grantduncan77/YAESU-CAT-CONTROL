@@ -26,6 +26,7 @@ typedef struct {
     uint8_t power_w;
     bool dnr_on;
     uint8_t dnr_level;
+    uint8_t width_index;
     uint32_t ok_count;
     uint32_t fail_count;
     uint32_t last_cat_ms;

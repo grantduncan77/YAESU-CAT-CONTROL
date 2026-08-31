@@ -1,6 +1,7 @@
 # ESP-IDF build outputs
 build/
 **/build/
+**/build*/
 **/managed_components/*
 
 # Keep the locally modified USB component used by the JI1FGX/Hub experiment.

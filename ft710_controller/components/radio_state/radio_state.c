@@ -10,6 +10,7 @@ void radio_state_init(radio_state_t *state)
     state->mode_b = FT710_MODE_UNKNOWN;
     state->power_w = 5;
     state->dnr_level = 0;
+    state->width_index = 0;
 }
 
 const char *radio_state_mode_name(ft710_mode_t mode)

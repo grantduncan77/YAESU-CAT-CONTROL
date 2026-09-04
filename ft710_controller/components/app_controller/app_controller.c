@@ -51,6 +51,10 @@ typedef enum {
     CMD_SET_MODE,
     CMD_SELECT_MAIN_VFO,
     CMD_SET_BAND_FREQ,
+    CMD_SET_NOISE_BLANKER,
+    CMD_SET_NOISE_BLANKER_LEVEL,
+    CMD_SET_NOTCH,
+    CMD_SET_MIC_GAIN,
 } app_cmd_type_t;
 
 typedef struct {
@@ -70,6 +74,7 @@ typedef enum {
     SCREEN_MAIN,
     SCREEN_WIFI,
     SCREEN_WIFI_KEYBOARD,
+    SCREEN_CONFIG,
 } app_screen_t;
 
 typedef enum {
@@ -122,11 +127,6 @@ typedef struct {
 #define MCP23017_REG_GPPUB 0x0D
 #define MCP23017_REG_GPIOA 0x12
 #define MCP23017_REG_GPIOB 0x13
-#define MCP23017_FREQ_ENCODER_MASK 0x07
-#define MCP23017_DNR_ENCODER_MASK (BIT(3) | BIT(4) | BIT(5))
-#define MCP23017_POWER_ENCODER_A_MASK (BIT(6) | BIT(7))
-#define MCP23017_POWER_ENCODER_B_MASK BIT(0)
-#define MCP23017_WIDTH_ENCODER_B_MASK (BIT(5) | BIT(6) | BIT(7))
 #define AUX_I2C_HZ 100000
 #define AUX_OLED_WIDTH 128
 #define AUX_OLED_HEIGHT 64
@@ -134,11 +134,24 @@ typedef struct {
 #define AUX_OLED_ADDR_PRIMARY 0x3C
 #define AUX_OLED_ADDR_SECONDARY 0x3D
 #define TCA9548A_ADDR 0x70
-#define TCA9548A_WIDTH_OLED_CHANNEL 2
-#define TCA9548A_POWER_OLED_CHANNEL 3
-#define TCA9548A_DNR_OLED_CHANNEL 4
+#define TCA9548A_FREQ_OLED_CHANNEL 3
+#define TCA9548A_DNR_OLED_CHANNEL 2
+#define TCA9548A_POWER_OLED_CHANNEL 4
+#define TCA9548A_WIDTH_OLED_CHANNEL 5
+#define TCA9548A_SLOT5_OLED_CHANNEL 6
 #define WIDTH_INDEX_MIN 0
 #define WIDTH_INDEX_MAX 23
+#define CONTROL_SLOT_COUNT 5
+#define MAIN_PANEL_COUNT 4
+#define CONFIG_FUNCTION_COUNT 8
+#define NB_LEVEL_MAX 10
+#define NOTCH_VALUE_MAX 99
+#define MIC_GAIN_MAX 100
+#define CAT_QUERY_TIMEOUT_MS 120
+#define CAT_TX_TIMEOUT_MS 100
+#define CAT_OFFLINE_FAIL_LIMIT 4
+#define CAT_OFFLINE_PROBE_MS 700
+#define AUX_OLED_RETRY_MS 2000
 
 typedef struct {
     i2c_master_dev_handle_t dev;
@@ -146,9 +159,167 @@ typedef struct {
     uint8_t addr;
     uint8_t channel;
     bool ready;
+    TickType_t next_retry_tick;
     char last_title[12];
     char last_value[12];
 } aux_oled_t;
+
+typedef enum {
+    MCP_PORT_A,
+    MCP_PORT_B,
+} mcp_port_t;
+
+typedef enum {
+    CONTROL_FN_FREQUENCY,
+    CONTROL_FN_VFO_B_FREQUENCY,
+    CONTROL_FN_MODE,
+    CONTROL_FN_DNR,
+    CONTROL_FN_DNR_LEVEL,
+    CONTROL_FN_POWER,
+    CONTROL_FN_WIDTH,
+    CONTROL_FN_BAND_SELECT,
+    CONTROL_FN_VFO_SELECT,
+    CONTROL_FN_SWAP_VFO,
+    CONTROL_FN_COPY_A_TO_B,
+    CONTROL_FN_COPY_B_TO_A,
+    CONTROL_FN_AF_GAIN,
+    CONTROL_FN_RF_GAIN,
+    CONTROL_FN_SQUELCH,
+    CONTROL_FN_RF_ATTENUATOR,
+    CONTROL_FN_PREAMP_IPO,
+    CONTROL_FN_AGC,
+    CONTROL_FN_NOISE_BLANKER,
+    CONTROL_FN_NOISE_BLANKER_LEVEL,
+    CONTROL_FN_AUTO_NOTCH,
+    CONTROL_FN_MANUAL_NOTCH,
+    CONTROL_FN_CONTOUR,
+    CONTROL_FN_IF_SHIFT,
+    CONTROL_FN_NARROW,
+    CONTROL_FN_FINE_TUNING,
+    CONTROL_FN_LOCK,
+    CONTROL_FN_SPLIT,
+    CONTROL_FN_TX_FUNCTION,
+    CONTROL_FN_TXW,
+    CONTROL_FN_MIC_GAIN,
+    CONTROL_FN_MONITOR_LEVEL,
+    CONTROL_FN_AMC_LEVEL,
+    CONTROL_FN_SPEECH_PROCESSOR,
+    CONTROL_FN_SPEECH_PROCESSOR_LEVEL,
+    CONTROL_FN_VOX,
+    CONTROL_FN_VOX_GAIN,
+    CONTROL_FN_VOX_DELAY,
+    CONTROL_FN_ANTI_VOX,
+    CONTROL_FN_MEMORY_CHANNEL,
+    CONTROL_FN_MEMORY_READ,
+    CONTROL_FN_MEMORY_WRITE_TAG,
+    CONTROL_FN_MEMORY_WRITE,
+    CONTROL_FN_VFO_A_TO_MEMORY,
+    CONTROL_FN_VFO_B_TO_MEMORY,
+    CONTROL_FN_MEMORY_TO_VFO_A,
+    CONTROL_FN_MEMORY_TO_VFO_B,
+    CONTROL_FN_QMB_STORE,
+    CONTROL_FN_QMB_RECALL,
+    CONTROL_FN_SCAN,
+    CONTROL_FN_CHANNEL_UP_DOWN,
+    CONTROL_FN_LCD_DIMMER,
+    CONTROL_FN_DATE_TIME,
+    CONTROL_FN_MENU,
+    CONTROL_FN_POWER_SWITCH,
+    CONTROL_FN_AUTO_INFORMATION,
+    CONTROL_FN_RADIO_INFORMATION,
+    CONTROL_FN_READ_METER,
+    CONTROL_FN_S_METER,
+    CONTROL_FN_METER_SWITCH,
+    CONTROL_FN_SPECTRUM_SCOPE,
+    CONTROL_FN_GP_OUT,
+    CONTROL_FN_AESS,
+    CONTROL_FN_TX_SET,
+    CONTROL_FN_MOX,
+    CONTROL_FN_CW_KEYING,
+    CONTROL_FN_BREAK_IN,
+    CONTROL_FN_SEMI_BREAK_IN_DELAY,
+    CONTROL_FN_CW_SPOT,
+    CONTROL_FN_CW_PITCH,
+    CONTROL_FN_KEYER,
+    CONTROL_FN_KEY_SPEED,
+    CONTROL_FN_ANTENNA_TUNER,
+    CONTROL_FN_BAND_DOWN,
+    CONTROL_FN_BAND_UP,
+    CONTROL_FN_DOWN,
+    CONTROL_FN_UP,
+    CONTROL_FN_VM_KEY,
+    CONTROL_FN_PLAY_BACK,
+    CONTROL_FN_LOAD_MESSAGE,
+    CONTROL_FN_KEYER_MEMORY,
+    CONTROL_FN_SUB_DIAL,
+    CONTROL_FN_ZERO_IN,
+    CONTROL_FN_SLOT_TEST,
+} control_function_t;
+
+typedef enum {
+    FEATURE_GROUP_CORE,
+    FEATURE_GROUP_RX_DSP,
+    FEATURE_GROUP_TX_AUDIO,
+    FEATURE_GROUP_MEMORY,
+    FEATURE_GROUP_SYSTEM,
+    FEATURE_GROUP_METER,
+    FEATURE_GROUP_NAVIGATION,
+    FEATURE_GROUP_TX_RISK,
+} feature_group_t;
+
+typedef enum {
+    FEATURE_UI_NONE = 0,
+    FEATURE_UI_MAIN_PANEL = BIT(0),
+    FEATURE_UI_BUTTON = BIT(1),
+    FEATURE_UI_ENCODER = BIT(2),
+    FEATURE_UI_OLED = BIT(3),
+    FEATURE_UI_PAGE = BIT(4),
+    FEATURE_UI_CONFIRM = BIT(5),
+    FEATURE_UI_STATUS_BAR = BIT(6),
+} feature_ui_flags_t;
+
+typedef enum {
+    FEATURE_ACCESS_READ_ONLY,
+    FEATURE_ACCESS_WRITE_ONLY,
+    FEATURE_ACCESS_READ_WRITE,
+} feature_access_t;
+
+typedef struct {
+    control_function_t function;
+    const char *cat_cmd;
+    const char *display;
+    const char *description;
+    feature_group_t group;
+    feature_access_t access;
+    uint32_t ui_flags;
+    bool implemented;
+} feature_catalog_item_t;
+
+typedef struct {
+    mcp_port_t port;
+    uint8_t bit;
+} mcp_pin_t;
+
+typedef struct {
+    const char *name;
+    control_function_t function;
+    mcp_pin_t a;
+    mcp_pin_t b;
+    mcp_pin_t button;
+    bool a_maps_to_bit1;
+    aux_oled_t *oled;
+    uint8_t prev_ab;
+    int8_t quad_accum;
+    bool stable_button;
+    bool last_button_sample;
+    TickType_t last_button_change;
+} control_slot_t;
+
+typedef enum {
+    CONFIG_TARGET_NONE,
+    CONFIG_TARGET_SLOT,
+    CONFIG_TARGET_PANEL,
+} config_target_type_t;
 
 static QueueHandle_t s_rx_queue;
 static QueueHandle_t s_cmd_queue;
@@ -181,9 +352,249 @@ static uint16_t s_wifi_ap_count;
 static bool s_wifi_bridge_task_started;
 static i2c_master_dev_handle_t s_mcp23017_dev;
 static i2c_master_dev_handle_t s_tca9548a_dev;
+static aux_oled_t s_freq_oled = {.channel = TCA9548A_FREQ_OLED_CHANNEL};
 static aux_oled_t s_power_oled = {.channel = TCA9548A_POWER_OLED_CHANNEL};
 static aux_oled_t s_dnr_oled = {.channel = TCA9548A_DNR_OLED_CHANNEL};
 static aux_oled_t s_width_oled = {.channel = TCA9548A_WIDTH_OLED_CHANNEL};
+static aux_oled_t s_slot5_oled = {.channel = TCA9548A_SLOT5_OLED_CHANNEL};
+static int s_slot5_value;
+static config_target_type_t s_config_target_type = CONFIG_TARGET_NONE;
+static int s_config_target_index = -1;
+static control_function_t s_config_pending_function = CONTROL_FN_WIDTH;
+static const control_function_t s_config_functions[CONFIG_FUNCTION_COUNT] = {
+    CONTROL_FN_WIDTH,
+    CONTROL_FN_POWER,
+    CONTROL_FN_DNR_LEVEL,
+    CONTROL_FN_BAND_SELECT,
+    CONTROL_FN_MODE,
+    CONTROL_FN_NOISE_BLANKER,
+    CONTROL_FN_MANUAL_NOTCH,
+    CONTROL_FN_MIC_GAIN,
+};
+static control_function_t s_main_panel_functions[MAIN_PANEL_COUNT] = {
+    CONTROL_FN_POWER,
+    CONTROL_FN_DNR_LEVEL,
+    CONTROL_FN_MODE,
+    CONTROL_FN_BAND_SELECT,
+};
+static control_slot_t s_control_slots[] = {
+    {
+        .name = "group1",
+        .function = CONTROL_FN_FREQUENCY,
+        .a = {MCP_PORT_A, 0},
+        .b = {MCP_PORT_A, 1},
+        .button = {MCP_PORT_A, 2},
+        .oled = &s_freq_oled,
+    },
+    {
+        .name = "group2",
+        .function = CONTROL_FN_DNR,
+        .a = {MCP_PORT_A, 3},
+        .b = {MCP_PORT_A, 4},
+        .button = {MCP_PORT_A, 5},
+        .oled = &s_dnr_oled,
+    },
+    {
+        .name = "group3",
+        .function = CONTROL_FN_POWER,
+        .a = {MCP_PORT_A, 6},
+        .b = {MCP_PORT_A, 7},
+        .button = {MCP_PORT_B, 1},
+        .oled = &s_power_oled,
+    },
+    {
+        .name = "group4",
+        .function = CONTROL_FN_WIDTH,
+        .a = {MCP_PORT_B, 7},
+        .b = {MCP_PORT_B, 6},
+        .button = {MCP_PORT_B, 5},
+        .a_maps_to_bit1 = true,
+        .oled = &s_width_oled,
+    },
+    {
+        .name = "group5",
+        .function = CONTROL_FN_SLOT_TEST,
+        .a = {MCP_PORT_B, 4},
+        .b = {MCP_PORT_B, 3},
+        .button = {MCP_PORT_B, 2},
+        .a_maps_to_bit1 = true,
+        .oled = &s_slot5_oled,
+    },
+};
+
+static const feature_catalog_item_t s_feature_catalog[] = {
+    {CONTROL_FN_FREQUENCY, "FA", "VFO-A", "VFO-A frequency", FEATURE_GROUP_CORE, FEATURE_ACCESS_READ_WRITE,
+     FEATURE_UI_MAIN_PANEL | FEATURE_UI_ENCODER | FEATURE_UI_OLED, true},
+    {CONTROL_FN_VFO_B_FREQUENCY, "FB", "VFO-B", "VFO-B frequency", FEATURE_GROUP_CORE, FEATURE_ACCESS_READ_WRITE,
+     FEATURE_UI_MAIN_PANEL | FEATURE_UI_ENCODER | FEATURE_UI_OLED, true},
+    {CONTROL_FN_MODE, "MD", "MODE", "Modulation mode", FEATURE_GROUP_CORE, FEATURE_ACCESS_READ_WRITE,
+     FEATURE_UI_MAIN_PANEL | FEATURE_UI_BUTTON, true},
+    {CONTROL_FN_POWER, "PC", "RF PWR", "RF output power", FEATURE_GROUP_CORE, FEATURE_ACCESS_READ_WRITE,
+     FEATURE_UI_MAIN_PANEL | FEATURE_UI_ENCODER | FEATURE_UI_OLED, true},
+    {CONTROL_FN_DNR, "NR", "DNR", "DNR on/off", FEATURE_GROUP_CORE, FEATURE_ACCESS_READ_WRITE,
+     FEATURE_UI_MAIN_PANEL | FEATURE_UI_BUTTON | FEATURE_UI_ENCODER | FEATURE_UI_OLED, true},
+    {CONTROL_FN_DNR_LEVEL, "RL", "DNR LVL", "DNR level", FEATURE_GROUP_CORE, FEATURE_ACCESS_READ_WRITE,
+     FEATURE_UI_ENCODER | FEATURE_UI_OLED, true},
+    {CONTROL_FN_WIDTH, "SH", "WIDTH", "IF width", FEATURE_GROUP_CORE, FEATURE_ACCESS_READ_WRITE,
+     FEATURE_UI_ENCODER | FEATURE_UI_OLED, true},
+    {CONTROL_FN_BAND_SELECT, "BS", "BAND", "Band select", FEATURE_GROUP_CORE, FEATURE_ACCESS_WRITE_ONLY,
+     FEATURE_UI_MAIN_PANEL | FEATURE_UI_BUTTON, true},
+    {CONTROL_FN_VFO_SELECT, "VS", "VFO", "Current working VFO A/B select", FEATURE_GROUP_CORE,
+     FEATURE_ACCESS_READ_WRITE, FEATURE_UI_BUTTON | FEATURE_UI_STATUS_BAR, true},
+    {CONTROL_FN_SWAP_VFO, "SV", "A/B", "Swap VFO", FEATURE_GROUP_CORE, FEATURE_ACCESS_WRITE_ONLY,
+     FEATURE_UI_BUTTON, true},
+    {CONTROL_FN_COPY_A_TO_B, "AB", "A>B", "Copy VFO-A to VFO-B", FEATURE_GROUP_CORE, FEATURE_ACCESS_WRITE_ONLY,
+     FEATURE_UI_BUTTON | FEATURE_UI_CONFIRM, false},
+    {CONTROL_FN_COPY_B_TO_A, "BA", "B>A", "Copy VFO-B to VFO-A", FEATURE_GROUP_CORE, FEATURE_ACCESS_WRITE_ONLY,
+     FEATURE_UI_BUTTON | FEATURE_UI_CONFIRM, false},
+    {CONTROL_FN_AF_GAIN, "AG", "VOLUME", "AF gain", FEATURE_GROUP_RX_DSP, FEATURE_ACCESS_READ_WRITE,
+     FEATURE_UI_ENCODER | FEATURE_UI_OLED, false},
+    {CONTROL_FN_RF_GAIN, "RG", "RF GAIN", "Receiver RF gain", FEATURE_GROUP_RX_DSP, FEATURE_ACCESS_READ_WRITE,
+     FEATURE_UI_ENCODER | FEATURE_UI_OLED, false},
+    {CONTROL_FN_SQUELCH, "SQ", "SQLCH", "Squelch level", FEATURE_GROUP_RX_DSP, FEATURE_ACCESS_READ_WRITE,
+     FEATURE_UI_ENCODER | FEATURE_UI_OLED, false},
+    {CONTROL_FN_RF_ATTENUATOR, "RA", "ATT", "RF attenuator", FEATURE_GROUP_RX_DSP, FEATURE_ACCESS_READ_WRITE,
+     FEATURE_UI_BUTTON | FEATURE_UI_ENCODER, false},
+    {CONTROL_FN_PREAMP_IPO, "PA", "IPO/AMP", "IPO and preamp select", FEATURE_GROUP_RX_DSP, FEATURE_ACCESS_READ_WRITE,
+     FEATURE_UI_BUTTON, false},
+    {CONTROL_FN_AGC, "GT", "AGC", "AGC speed", FEATURE_GROUP_RX_DSP, FEATURE_ACCESS_READ_WRITE,
+     FEATURE_UI_BUTTON, false},
+    {CONTROL_FN_NOISE_BLANKER, "NB", "NB", "Noise blanker on/off", FEATURE_GROUP_RX_DSP, FEATURE_ACCESS_READ_WRITE,
+     FEATURE_UI_BUTTON | FEATURE_UI_ENCODER | FEATURE_UI_OLED, true},
+    {CONTROL_FN_NOISE_BLANKER_LEVEL, "NL", "NB LVL", "Noise blanker level", FEATURE_GROUP_RX_DSP,
+     FEATURE_ACCESS_READ_WRITE, FEATURE_UI_ENCODER | FEATURE_UI_OLED, false},
+    {CONTROL_FN_AUTO_NOTCH, "BC", "DNF", "Auto notch / DNF", FEATURE_GROUP_RX_DSP, FEATURE_ACCESS_READ_WRITE,
+     FEATURE_UI_BUTTON, false},
+    {CONTROL_FN_MANUAL_NOTCH, "BP", "NTCH", "Manual notch", FEATURE_GROUP_RX_DSP, FEATURE_ACCESS_READ_WRITE,
+     FEATURE_UI_BUTTON | FEATURE_UI_ENCODER | FEATURE_UI_OLED, true},
+    {CONTROL_FN_CONTOUR, "CO", "CONTOUR", "Contour / APF", FEATURE_GROUP_RX_DSP, FEATURE_ACCESS_READ_WRITE,
+     FEATURE_UI_ENCODER | FEATURE_UI_OLED, false},
+    {CONTROL_FN_IF_SHIFT, "IS", "SHFT", "IF shift", FEATURE_GROUP_RX_DSP, FEATURE_ACCESS_READ_WRITE,
+     FEATURE_UI_ENCODER | FEATURE_UI_OLED, false},
+    {CONTROL_FN_NARROW, "NA", "NAR", "Narrow filter", FEATURE_GROUP_RX_DSP, FEATURE_ACCESS_READ_WRITE,
+     FEATURE_UI_BUTTON, false},
+    {CONTROL_FN_FINE_TUNING, "FN", "FINE", "Fine tuning", FEATURE_GROUP_RX_DSP, FEATURE_ACCESS_READ_WRITE,
+     FEATURE_UI_BUTTON, false},
+    {CONTROL_FN_LOCK, "LK", "LOCK", "Lock", FEATURE_GROUP_CORE, FEATURE_ACCESS_READ_WRITE,
+     FEATURE_UI_BUTTON | FEATURE_UI_STATUS_BAR, false},
+    {CONTROL_FN_SPLIT, "ST", "SPLIT", "Split operation", FEATURE_GROUP_CORE, FEATURE_ACCESS_READ_WRITE,
+     FEATURE_UI_BUTTON | FEATURE_UI_STATUS_BAR, false},
+    {CONTROL_FN_TX_FUNCTION, "FT", "TX FUNC", "TX function page", FEATURE_GROUP_TX_RISK, FEATURE_ACCESS_READ_WRITE,
+     FEATURE_UI_PAGE | FEATURE_UI_CONFIRM, false},
+    {CONTROL_FN_TXW, "TS", "TXW", "Transmit watch", FEATURE_GROUP_TX_RISK, FEATURE_ACCESS_READ_WRITE,
+     FEATURE_UI_PAGE | FEATURE_UI_CONFIRM, false},
+    {CONTROL_FN_TX_SET, "TX", "TX SET", "Transmit control", FEATURE_GROUP_TX_RISK, FEATURE_ACCESS_READ_WRITE,
+     FEATURE_UI_PAGE | FEATURE_UI_CONFIRM, false},
+    {CONTROL_FN_MOX, "MX", "MOX", "MOX set", FEATURE_GROUP_TX_RISK, FEATURE_ACCESS_READ_WRITE,
+     FEATURE_UI_PAGE | FEATURE_UI_CONFIRM, false},
+    {CONTROL_FN_CW_KEYING, "KY", "CW KEY", "CW keying", FEATURE_GROUP_TX_RISK, FEATURE_ACCESS_WRITE_ONLY,
+     FEATURE_UI_PAGE | FEATURE_UI_CONFIRM, false},
+    {CONTROL_FN_BREAK_IN, "BI", "BK-IN", "Break-in", FEATURE_GROUP_TX_RISK, FEATURE_ACCESS_READ_WRITE,
+     FEATURE_UI_PAGE | FEATURE_UI_CONFIRM, false},
+    {CONTROL_FN_SEMI_BREAK_IN_DELAY, "SD", "BK DLY", "Semi break-in delay", FEATURE_GROUP_TX_RISK,
+     FEATURE_ACCESS_READ_WRITE, FEATURE_UI_PAGE | FEATURE_UI_ENCODER, false},
+    {CONTROL_FN_CW_SPOT, "CS", "SPOT", "CW spot", FEATURE_GROUP_TX_RISK, FEATURE_ACCESS_READ_WRITE,
+     FEATURE_UI_PAGE | FEATURE_UI_BUTTON, false},
+    {CONTROL_FN_CW_PITCH, "KP", "CW PCH", "CW pitch", FEATURE_GROUP_TX_RISK, FEATURE_ACCESS_READ_WRITE,
+     FEATURE_UI_PAGE | FEATURE_UI_ENCODER, false},
+    {CONTROL_FN_KEYER, "KR", "KEYER", "Keyer", FEATURE_GROUP_TX_RISK, FEATURE_ACCESS_READ_WRITE,
+     FEATURE_UI_PAGE | FEATURE_UI_BUTTON, false},
+    {CONTROL_FN_KEY_SPEED, "KS", "CW SPD", "Keyer speed", FEATURE_GROUP_TX_RISK, FEATURE_ACCESS_READ_WRITE,
+     FEATURE_UI_PAGE | FEATURE_UI_ENCODER, false},
+    {CONTROL_FN_ANTENNA_TUNER, "AC", "TUNER", "Antenna tuner control", FEATURE_GROUP_TX_RISK,
+     FEATURE_ACCESS_READ_WRITE, FEATURE_UI_BUTTON | FEATURE_UI_CONFIRM, false},
+    {CONTROL_FN_MIC_GAIN, "MG", "MIC LVL", "Microphone gain", FEATURE_GROUP_TX_AUDIO, FEATURE_ACCESS_READ_WRITE,
+     FEATURE_UI_ENCODER | FEATURE_UI_OLED, true},
+    {CONTROL_FN_MONITOR_LEVEL, "ML", "MONI", "Monitor level", FEATURE_GROUP_TX_AUDIO, FEATURE_ACCESS_READ_WRITE,
+     FEATURE_UI_ENCODER, false},
+    {CONTROL_FN_AMC_LEVEL, "AO", "AMC", "AMC output level", FEATURE_GROUP_TX_AUDIO, FEATURE_ACCESS_READ_WRITE,
+     FEATURE_UI_PAGE, false},
+    {CONTROL_FN_SPEECH_PROCESSOR, "PR", "PROC", "Speech processor", FEATURE_GROUP_TX_AUDIO,
+     FEATURE_ACCESS_READ_WRITE, FEATURE_UI_BUTTON, false},
+    {CONTROL_FN_SPEECH_PROCESSOR_LEVEL, "PL", "PROC LVL", "Speech processor level", FEATURE_GROUP_TX_AUDIO,
+     FEATURE_ACCESS_READ_WRITE, FEATURE_UI_ENCODER, false},
+    {CONTROL_FN_VOX, "VX", "VOX", "VOX", FEATURE_GROUP_TX_AUDIO, FEATURE_ACCESS_READ_WRITE, FEATURE_UI_BUTTON,
+     false},
+    {CONTROL_FN_VOX_GAIN, "VG", "VOX LVL", "VOX gain", FEATURE_GROUP_TX_AUDIO, FEATURE_ACCESS_READ_WRITE,
+     FEATURE_UI_ENCODER, false},
+    {CONTROL_FN_VOX_DELAY, "VD", "VOX DLY", "VOX delay time", FEATURE_GROUP_TX_AUDIO, FEATURE_ACCESS_READ_WRITE,
+     FEATURE_UI_ENCODER, false},
+    {CONTROL_FN_ANTI_VOX, "AV", "ANTI VOX", "Anti VOX level", FEATURE_GROUP_TX_AUDIO, FEATURE_ACCESS_READ_WRITE,
+     FEATURE_UI_PAGE, false},
+    {CONTROL_FN_MEMORY_CHANNEL, "MC", "MEM", "Memory channel", FEATURE_GROUP_MEMORY, FEATURE_ACCESS_READ_WRITE,
+     FEATURE_UI_PAGE | FEATURE_UI_ENCODER, false},
+    {CONTROL_FN_MEMORY_READ, "MR", "MEM READ", "Memory read", FEATURE_GROUP_MEMORY, FEATURE_ACCESS_READ_ONLY,
+     FEATURE_UI_PAGE, false},
+    {CONTROL_FN_MEMORY_WRITE_TAG, "MT", "MEM TAG", "Memory write / tag", FEATURE_GROUP_MEMORY,
+     FEATURE_ACCESS_READ_WRITE, FEATURE_UI_PAGE, false},
+    {CONTROL_FN_MEMORY_WRITE, "MW", "MEM WR", "Memory write", FEATURE_GROUP_MEMORY, FEATURE_ACCESS_WRITE_ONLY,
+     FEATURE_UI_PAGE | FEATURE_UI_CONFIRM, false},
+    {CONTROL_FN_VFO_A_TO_MEMORY, "AM", "A>MEM", "VFO-A to memory", FEATURE_GROUP_MEMORY, FEATURE_ACCESS_WRITE_ONLY,
+     FEATURE_UI_PAGE | FEATURE_UI_CONFIRM, false},
+    {CONTROL_FN_VFO_B_TO_MEMORY, "BM", "B>MEM", "VFO-B to memory", FEATURE_GROUP_MEMORY, FEATURE_ACCESS_WRITE_ONLY,
+     FEATURE_UI_PAGE | FEATURE_UI_CONFIRM, false},
+    {CONTROL_FN_MEMORY_TO_VFO_A, "MA", "MEM>A", "Memory to VFO-A", FEATURE_GROUP_MEMORY, FEATURE_ACCESS_WRITE_ONLY,
+     FEATURE_UI_PAGE | FEATURE_UI_CONFIRM, false},
+    {CONTROL_FN_MEMORY_TO_VFO_B, "MB", "MEM>B", "Memory to VFO-B", FEATURE_GROUP_MEMORY, FEATURE_ACCESS_WRITE_ONLY,
+     FEATURE_UI_PAGE | FEATURE_UI_CONFIRM, false},
+    {CONTROL_FN_QMB_STORE, "QI", "QMB STO", "QMB store", FEATURE_GROUP_MEMORY, FEATURE_ACCESS_WRITE_ONLY,
+     FEATURE_UI_BUTTON, false},
+    {CONTROL_FN_QMB_RECALL, "QR", "QMB RCL", "QMB recall", FEATURE_GROUP_MEMORY, FEATURE_ACCESS_WRITE_ONLY,
+     FEATURE_UI_BUTTON, false},
+    {CONTROL_FN_SCAN, "SC", "SCAN", "Scan", FEATURE_GROUP_MEMORY, FEATURE_ACCESS_READ_WRITE,
+     FEATURE_UI_PAGE, false},
+    {CONTROL_FN_CHANNEL_UP_DOWN, "CH", "CH", "Channel up/down", FEATURE_GROUP_MEMORY, FEATURE_ACCESS_WRITE_ONLY,
+     FEATURE_UI_ENCODER, false},
+    {CONTROL_FN_LCD_DIMMER, "DA", "DIMMER", "LCD contrast / dimmer", FEATURE_GROUP_SYSTEM,
+     FEATURE_ACCESS_READ_WRITE, FEATURE_UI_PAGE, false},
+    {CONTROL_FN_DATE_TIME, "DT", "TIME", "Date and time", FEATURE_GROUP_SYSTEM, FEATURE_ACCESS_READ_WRITE,
+     FEATURE_UI_PAGE | FEATURE_UI_STATUS_BAR, false},
+    {CONTROL_FN_MENU, "EX", "MENU", "Menu", FEATURE_GROUP_SYSTEM, FEATURE_ACCESS_READ_WRITE, FEATURE_UI_PAGE,
+     false},
+    {CONTROL_FN_POWER_SWITCH, "PS", "PWR", "Power switch", FEATURE_GROUP_SYSTEM, FEATURE_ACCESS_READ_WRITE,
+     FEATURE_UI_CONFIRM, false},
+    {CONTROL_FN_AUTO_INFORMATION, "AI", "AI", "Auto information", FEATURE_GROUP_SYSTEM, FEATURE_ACCESS_READ_WRITE,
+     FEATURE_UI_PAGE, false},
+    {CONTROL_FN_RADIO_INFORMATION, "RI", "INFO", "Radio information", FEATURE_GROUP_SYSTEM, FEATURE_ACCESS_READ_ONLY,
+     FEATURE_UI_PAGE | FEATURE_UI_STATUS_BAR, false},
+    {CONTROL_FN_READ_METER, "RM", "METER", "Read meter including PO/SWR/ALC", FEATURE_GROUP_METER,
+     FEATURE_ACCESS_READ_ONLY, FEATURE_UI_PAGE | FEATURE_UI_OLED, false},
+    {CONTROL_FN_S_METER, "SM", "S METER", "S meter", FEATURE_GROUP_METER, FEATURE_ACCESS_READ_ONLY,
+     FEATURE_UI_MAIN_PANEL | FEATURE_UI_OLED, false},
+    {CONTROL_FN_METER_SWITCH, "MS", "METER SW", "Meter switch", FEATURE_GROUP_METER, FEATURE_ACCESS_READ_WRITE,
+     FEATURE_UI_PAGE, false},
+    {CONTROL_FN_SPECTRUM_SCOPE, "SS", "SCOPE", "Spectrum scope", FEATURE_GROUP_METER, FEATURE_ACCESS_READ_WRITE,
+     FEATURE_UI_PAGE, false},
+    {CONTROL_FN_GP_OUT, "GP", "GP OUT", "GP output A/B/C/D", FEATURE_GROUP_SYSTEM, FEATURE_ACCESS_READ_WRITE,
+     FEATURE_UI_PAGE, false},
+    {CONTROL_FN_AESS, "AS", "AESS", "AESS balance", FEATURE_GROUP_TX_AUDIO, FEATURE_ACCESS_READ_WRITE,
+     FEATURE_UI_BUTTON, false},
+    {CONTROL_FN_BAND_DOWN, "BD", "BAND-", "Band down", FEATURE_GROUP_NAVIGATION, FEATURE_ACCESS_WRITE_ONLY,
+     FEATURE_UI_BUTTON, false},
+    {CONTROL_FN_BAND_UP, "BU", "BAND+", "Band up", FEATURE_GROUP_NAVIGATION, FEATURE_ACCESS_WRITE_ONLY,
+     FEATURE_UI_BUTTON, false},
+    {CONTROL_FN_DOWN, "DN", "DOWN", "Down", FEATURE_GROUP_NAVIGATION, FEATURE_ACCESS_WRITE_ONLY,
+     FEATURE_UI_BUTTON, false},
+    {CONTROL_FN_UP, "UP", "UP", "Up", FEATURE_GROUP_NAVIGATION, FEATURE_ACCESS_WRITE_ONLY, FEATURE_UI_BUTTON,
+     false},
+    {CONTROL_FN_VM_KEY, "VM", "V/M", "V/M key function", FEATURE_GROUP_NAVIGATION, FEATURE_ACCESS_WRITE_ONLY,
+     FEATURE_UI_BUTTON, false},
+    {CONTROL_FN_PLAY_BACK, "PB", "PLAY", "Play back", FEATURE_GROUP_SYSTEM, FEATURE_ACCESS_READ_WRITE,
+     FEATURE_UI_PAGE, false},
+    {CONTROL_FN_LOAD_MESSAGE, "LM", "LOAD MSG", "Load message", FEATURE_GROUP_TX_RISK, FEATURE_ACCESS_READ_WRITE,
+     FEATURE_UI_PAGE, false},
+    {CONTROL_FN_KEYER_MEMORY, "KM", "KEY MEM", "Keyer memory", FEATURE_GROUP_TX_RISK, FEATURE_ACCESS_READ_WRITE,
+     FEATURE_UI_PAGE, false},
+    {CONTROL_FN_SUB_DIAL, "SF", "SUB DIAL", "Sub dial", FEATURE_GROUP_NAVIGATION, FEATURE_ACCESS_WRITE_ONLY,
+     FEATURE_UI_ENCODER, false},
+    {CONTROL_FN_ZERO_IN, "ZI", "ZERO IN", "Zero in", FEATURE_GROUP_TX_RISK, FEATURE_ACCESS_WRITE_ONLY,
+     FEATURE_UI_PAGE, false},
+    {CONTROL_FN_SLOT_TEST, "--", "SLOT5", "Hardware slot test counter", FEATURE_GROUP_SYSTEM,
+     FEATURE_ACCESS_READ_WRITE, FEATURE_UI_ENCODER | FEATURE_UI_OLED, true},
+};
+
+static const char *control_function_name(control_function_t function);
+static const feature_catalog_item_t *feature_catalog_find(control_function_t function);
 
 static lv_obj_t *s_cat_status;
 static lv_obj_t *s_bt_status;
@@ -208,6 +619,16 @@ static lv_obj_t *s_dnr_label;
 static lv_obj_t *s_dnr_cmd_label;
 static lv_obj_t *s_mode_btns[5];
 static lv_obj_t *s_band_btns[6];
+static lv_obj_t *s_panel_value_labels[MAIN_PANEL_COUNT];
+static lv_obj_t *s_config_slot_btns[CONTROL_SLOT_COUNT];
+static lv_obj_t *s_config_panel_btns[MAIN_PANEL_COUNT];
+static const char *s_config_slot_ids[CONTROL_SLOT_COUNT] = {"CFG_SLOT_0", "CFG_SLOT_1", "CFG_SLOT_2", "CFG_SLOT_3",
+                                                            "CFG_SLOT_4"};
+static const char *s_config_panel_ids[MAIN_PANEL_COUNT] = {"CFG_PANEL_0", "CFG_PANEL_1", "CFG_PANEL_2",
+                                                           "CFG_PANEL_3"};
+static const char *s_panel_minus_ids[MAIN_PANEL_COUNT] = {"FP0_MINUS", "FP1_MINUS", "FP2_MINUS", "FP3_MINUS"};
+static const char *s_panel_plus_ids[MAIN_PANEL_COUNT] = {"FP0_PLUS", "FP1_PLUS", "FP2_PLUS", "FP3_PLUS"};
+static const char *s_panel_toggle_ids[MAIN_PANEL_COUNT] = {"FP0_TOGGLE", "FP1_TOGGLE", "FP2_TOGGLE", "FP3_TOGGLE"};
 
 static const lv_color_t C_BG = LV_COLOR_MAKE(0x04, 0x09, 0x0B);
 static const lv_color_t C_PANEL = LV_COLOR_MAKE(0x0B, 0x17, 0x1B);
@@ -223,6 +644,42 @@ static void update_ui_locked(void);
 static void create_ui(void);
 static void create_wifi_ui(void);
 static void create_wifi_keyboard_ui(void);
+static void create_config_ui(void);
+static void config_reset_selection(void);
+static void config_select_target(config_target_type_t type, int index);
+static void config_apply_selection(void);
+static void control_slot_set_function(int index, control_function_t function);
+static void aux_oled_refresh_slot(control_slot_t *slot, bool force);
+
+static void reset_ui_refs(void)
+{
+    s_cat_status = NULL;
+    s_bt_status = NULL;
+    s_wifi_status = NULL;
+    s_rx_status = NULL;
+    s_time_label = NULL;
+    s_wifi_conn_ssid_label = NULL;
+    s_wifi_ip_label = NULL;
+    s_wifi_gateway_label = NULL;
+    s_wifi_dns_label = NULL;
+    s_wifi_page_status_label = NULL;
+    s_freq_a = NULL;
+    s_freq_b = NULL;
+    s_vfo_a_tag = NULL;
+    s_vfo_b_tag = NULL;
+    s_vfo_a_meta = NULL;
+    s_vfo_b_meta = NULL;
+    s_input_hint = NULL;
+    s_power_label = NULL;
+    s_dnr_label = NULL;
+    s_dnr_cmd_label = NULL;
+    memset(s_power_step_btns, 0, sizeof(s_power_step_btns));
+    memset(s_mode_btns, 0, sizeof(s_mode_btns));
+    memset(s_band_btns, 0, sizeof(s_band_btns));
+    memset(s_panel_value_labels, 0, sizeof(s_panel_value_labels));
+    memset(s_config_slot_btns, 0, sizeof(s_config_slot_btns));
+    memset(s_config_panel_btns, 0, sizeof(s_config_panel_btns));
+}
 
 static bool rx_cb(const uint8_t *data, size_t data_len, void *arg)
 {
@@ -291,8 +748,9 @@ static esp_err_t cat_query(cdc_acm_dev_hdl_t dev, const char *cmd, char *resp, s
 {
     const int64_t start_us = esp_timer_get_time();
     flush_rx();
-    ESP_RETURN_ON_ERROR(cdc_acm_host_data_tx_blocking(dev, (const uint8_t *)cmd, strlen(cmd), 1000), TAG, "tx failed");
-    const esp_err_t err = read_frame(resp, resp_size, pdMS_TO_TICKS(500));
+    ESP_RETURN_ON_ERROR(cdc_acm_host_data_tx_blocking(dev, (const uint8_t *)cmd, strlen(cmd), CAT_TX_TIMEOUT_MS), TAG,
+                        "tx failed");
+    const esp_err_t err = read_frame(resp, resp_size, pdMS_TO_TICKS(CAT_QUERY_TIMEOUT_MS));
     if (elapsed_ms) {
         *elapsed_ms = (esp_timer_get_time() - start_us) / 1000;
     }
@@ -303,7 +761,7 @@ static esp_err_t cat_send(cdc_acm_dev_hdl_t dev, const char *cmd, int64_t *elaps
 {
     const int64_t start_us = esp_timer_get_time();
     flush_rx();
-    const esp_err_t err = cdc_acm_host_data_tx_blocking(dev, (const uint8_t *)cmd, strlen(cmd), 1000);
+    const esp_err_t err = cdc_acm_host_data_tx_blocking(dev, (const uint8_t *)cmd, strlen(cmd), CAT_TX_TIMEOUT_MS);
     if (elapsed_ms) {
         *elapsed_ms = (esp_timer_get_time() - start_us) / 1000;
     }
@@ -869,6 +1327,15 @@ static void aux_oled_draw_status(aux_oled_t *oled, const char *title, const char
     aux_oled_text(oled, (AUX_OLED_WIDTH - width) / 2, 20, value, scale);
 }
 
+static void aux_oled_invalidate(aux_oled_t *oled)
+{
+    if (!oled) {
+        return;
+    }
+    oled->last_title[0] = '\0';
+    oled->last_value[0] = '\0';
+}
+
 static void aux_oled_show_status(aux_oled_t *oled, const char *title, const char *value, bool force)
 {
     if (!oled->ready ||
@@ -885,6 +1352,17 @@ static void aux_oled_show_status(aux_oled_t *oled, const char *title, const char
         ESP_LOGW(TAG, "Aux OLED update failed: %s", esp_err_to_name(err));
     }
     i2c_give();
+}
+
+static void aux_oled_show_frequency(bool force)
+{
+    const uint32_t hz = s_input_target_vfo == 'B' ? s_state.vfo_b_hz : s_state.vfo_a_hz;
+    char title[8] = {};
+    char value[12] = {};
+    snprintf(title, sizeof(title), "VFO-%c", s_input_target_vfo);
+    snprintf(value, sizeof(value), "%lu.%03lu", (unsigned long)(hz / 1000000U),
+             (unsigned long)((hz / 1000U) % 1000U));
+    aux_oled_show_status(&s_freq_oled, title, value, force);
 }
 
 static void aux_oled_show_power(uint8_t power_w, bool force)
@@ -947,6 +1425,13 @@ static void aux_oled_show_dnr(bool force)
         snprintf(value, sizeof(value), "OFF");
     }
     aux_oled_show_status(&s_dnr_oled, "DNR", value, force);
+}
+
+static void aux_oled_show_slot5(bool force)
+{
+    char value[12] = {};
+    snprintf(value, sizeof(value), "%d", s_slot5_value);
+    aux_oled_show_status(&s_slot5_oled, "SLOT5", value, force);
 }
 
 static ft710_mode_t current_width_mode(void)
@@ -1055,15 +1540,124 @@ static void aux_oled_show_width(bool force)
     i2c_give();
 }
 
+static void feature_oled_text(control_function_t function, char *title, size_t title_size, char *value, size_t value_size)
+{
+    const feature_catalog_item_t *item = feature_catalog_find(function);
+    snprintf(title, title_size, "%s", item ? item->display : "SLOT");
+
+    switch (function) {
+    case CONTROL_FN_FREQUENCY: {
+        const uint32_t hz = s_input_target_vfo == 'B' ? s_state.vfo_b_hz : s_state.vfo_a_hz;
+        snprintf(title, title_size, "VFO-%c", s_input_target_vfo);
+        snprintf(value, value_size, "%lu.%03lu", (unsigned long)(hz / 1000000U),
+                 (unsigned long)((hz / 1000U) % 1000U));
+        break;
+    }
+    case CONTROL_FN_POWER:
+        if (s_power_encoder_selecting_step) {
+            snprintf(title, title_size, "RF STEP");
+            snprintf(value, value_size, "%uW", s_power_step);
+        } else {
+            snprintf(value, value_size, "%uW", s_state.power_w);
+        }
+        break;
+    case CONTROL_FN_DNR:
+    case CONTROL_FN_DNR_LEVEL:
+        snprintf(title, title_size, "DNR");
+        if (s_state.dnr_on) {
+            snprintf(value, value_size, "%02u", s_state.dnr_level);
+        } else {
+            snprintf(value, value_size, "OFF");
+        }
+        break;
+    case CONTROL_FN_WIDTH: {
+        const int hz = width_index_to_hz(current_width_mode(), s_state.width_index);
+        if (s_state.width_index == 0) {
+            snprintf(value, value_size, "DEF");
+        } else if (hz > 0) {
+            snprintf(value, value_size, "%d", hz);
+        } else {
+            snprintf(value, value_size, "---");
+        }
+        break;
+    }
+    case CONTROL_FN_BAND_SELECT: {
+        const uint32_t hz = s_state.active_vfo == 'B' ? s_state.vfo_b_hz : s_state.vfo_a_hz;
+        snprintf(value, value_size, "%luM", (unsigned long)(hz / 1000000U));
+        break;
+    }
+    case CONTROL_FN_MODE:
+        snprintf(value, value_size, "%s",
+                 radio_state_mode_name(s_input_target_vfo == 'B' ? s_state.mode_b : s_state.mode_a));
+        break;
+    case CONTROL_FN_NOISE_BLANKER:
+        if (s_state.noise_blanker_on) {
+            snprintf(value, value_size, "%02u", s_state.noise_blanker_level);
+        } else {
+            snprintf(value, value_size, "OFF");
+        }
+        break;
+    case CONTROL_FN_MANUAL_NOTCH:
+        if (s_state.notch_on) {
+            snprintf(value, value_size, "%03u", s_state.notch_value);
+        } else {
+            snprintf(value, value_size, "OFF");
+        }
+        break;
+    case CONTROL_FN_MIC_GAIN:
+        snprintf(value, value_size, "%03u", s_state.mic_gain);
+        break;
+    case CONTROL_FN_SLOT_TEST:
+        snprintf(value, value_size, "%d", s_slot5_value);
+        break;
+    default:
+        snprintf(value, value_size, "--");
+        break;
+    }
+}
+
+static void aux_oled_show_control_slot(control_slot_t *slot, bool force)
+{
+    if (!slot || !slot->oled || !slot->oled->ready) {
+        return;
+    }
+
+    if (slot->function == CONTROL_FN_WIDTH) {
+        if (!force && strcmp(slot->oled->last_title, "WIDTH") == 0) {
+            char value[12] = {};
+            snprintf(value, sizeof(value), "%c:%u:%02u", s_state.active_vfo, (unsigned)current_width_mode(),
+                     s_state.width_index);
+            if (strcmp(slot->oled->last_value, value) == 0) {
+                return;
+            }
+        }
+        if (!i2c_take(pdMS_TO_TICKS(50))) {
+            return;
+        }
+        aux_oled_draw_width(slot->oled, s_state.width_index);
+        const esp_err_t err = aux_oled_flush(slot->oled);
+        if (err == ESP_OK) {
+            char value[12] = {};
+            snprintf(value, sizeof(value), "%c:%u:%02u", s_state.active_vfo, (unsigned)current_width_mode(),
+                     s_state.width_index);
+            strlcpy(slot->oled->last_title, "WIDTH", sizeof(slot->oled->last_title));
+            strlcpy(slot->oled->last_value, value, sizeof(slot->oled->last_value));
+        }
+        i2c_give();
+        return;
+    }
+
+    char title[12] = {};
+    char value[12] = {};
+    feature_oled_text(slot->function, title, sizeof(title), value, sizeof(value));
+    aux_oled_show_status(slot->oled, title, value, force);
+}
+
 static void aux_oled_show_current(bool force)
 {
-    aux_oled_show_width(force);
-    if (s_power_encoder_selecting_step) {
-        aux_oled_show_power_step(s_power_step, force);
-    } else {
-        aux_oled_show_power(s_state.power_w, force);
+    for (size_t i = 0; i < sizeof(s_control_slots) / sizeof(s_control_slots[0]); ++i) {
+        aux_oled_refresh_slot(&s_control_slots[i], force);
     }
-    aux_oled_show_dnr(force);
 }
 
 static esp_err_t aux_oled_init_one(i2c_master_bus_handle_t bus, aux_oled_t *oled)
@@ -1086,12 +1680,18 @@ static esp_err_t aux_oled_init_one(i2c_master_bus_handle_t bus, aux_oled_t *oled
         .device_address = addr,
         .scl_speed_hz = AUX_I2C_HZ,
     };
-    if (s_width_oled.ready && s_width_oled.addr == addr && s_width_oled.dev) {
+    if (oled->dev) {
+        /* Reuse a device handle left from an earlier init attempt on this mux channel. */
+    } else if (s_freq_oled.ready && s_freq_oled.addr == addr && s_freq_oled.dev) {
+        oled->dev = s_freq_oled.dev;
+    } else if (s_width_oled.ready && s_width_oled.addr == addr && s_width_oled.dev) {
         oled->dev = s_width_oled.dev;
     } else if (s_power_oled.ready && s_power_oled.addr == addr && s_power_oled.dev) {
         oled->dev = s_power_oled.dev;
     } else if (s_dnr_oled.ready && s_dnr_oled.addr == addr && s_dnr_oled.dev) {
         oled->dev = s_dnr_oled.dev;
+    } else if (s_slot5_oled.ready && s_slot5_oled.addr == addr && s_slot5_oled.dev) {
+        oled->dev = s_slot5_oled.dev;
     } else {
         ESP_RETURN_ON_ERROR(i2c_master_bus_add_device(bus, &oled_cfg, &oled->dev), TAG, "add aux OLED");
     }
@@ -1102,6 +1702,35 @@ static esp_err_t aux_oled_init_one(i2c_master_bus_handle_t bus, aux_oled_t *oled
     ESP_LOGI(TAG, "Aux OLED ready: TCA9548A=0x%02X channel=%d SSD1306=0x%02X", TCA9548A_ADDR, oled->channel,
              oled->addr);
     return ESP_OK;
+}
+
+static void aux_oled_refresh_slot(control_slot_t *slot, bool force)
+{
+    if (!slot || !slot->oled) {
+        return;
+    }
+
+    if (force) {
+        aux_oled_invalidate(slot->oled);
+    }
+
+    if (!slot->oled->ready && s_tca9548a_dev) {
+        const TickType_t now = xTaskGetTickCount();
+        if (force || now >= slot->oled->next_retry_tick) {
+            slot->oled->next_retry_tick = now + pdMS_TO_TICKS(AUX_OLED_RETRY_MS);
+            i2c_master_bus_handle_t bus = bsp_i2c_get_handle();
+            if (bus && i2c_take(pdMS_TO_TICKS(10))) {
+                const esp_err_t err = aux_oled_init_one(bus, slot->oled);
+                i2c_give();
+                if (err != ESP_OK) {
+                    ESP_LOGW(TAG, "%s OLED refresh skipped, channel=%u init retry failed: %s", slot->name,
+                             slot->oled->channel, esp_err_to_name(err));
+                }
+            }
+        }
+    }
+
+    aux_oled_show_control_slot(slot, force);
 }
 
 static esp_err_t aux_oled_init(void)
@@ -1125,19 +1754,21 @@ static esp_err_t aux_oled_init(void)
         .scl_speed_hz = AUX_I2C_HZ,
     };
     ESP_GOTO_ON_ERROR(i2c_master_bus_add_device(bus, &tca_cfg, &s_tca9548a_dev), cleanup, TAG, "add TCA9548A");
-    ret = aux_oled_init_one(bus, &s_width_oled);
-    if (ret != ESP_OK) {
-        ESP_LOGW(TAG, "Width OLED disabled: %s", esp_err_to_name(ret));
+    bool any_oled_ready = false;
+    for (size_t i = 0; i < sizeof(s_control_slots) / sizeof(s_control_slots[0]); ++i) {
+        control_slot_t *slot = &s_control_slots[i];
+        if (!slot->oled) {
+            continue;
+        }
+        ret = aux_oled_init_one(bus, slot->oled);
+        if (ret == ESP_OK) {
+            any_oled_ready = true;
+        } else {
+            ESP_LOGW(TAG, "%s %s OLED disabled: %s", slot->name, control_function_name(slot->function),
+                     esp_err_to_name(ret));
+        }
     }
-    ret = aux_oled_init_one(bus, &s_power_oled);
-    if (ret != ESP_OK) {
-        ESP_LOGW(TAG, "Power OLED disabled: %s", esp_err_to_name(ret));
-    }
-    ret = aux_oled_init_one(bus, &s_dnr_oled);
-    if (ret != ESP_OK) {
-        ESP_LOGW(TAG, "DNR OLED disabled: %s", esp_err_to_name(ret));
-    }
-    ret = (s_width_oled.ready || s_power_oled.ready || s_dnr_oled.ready) ? ESP_OK : ESP_ERR_NOT_FOUND;
+    ret = any_oled_ready ? ESP_OK : ESP_ERR_NOT_FOUND;
 
 cleanup:
     i2c_give();
@@ -1216,11 +1847,6 @@ static void encoder_adjust_power_step(int delta)
 
     s_power_step = steps[index];
     ESP_LOGI(TAG, "Power encoder step select %uW", s_power_step);
-    aux_oled_show_current(true);
-    if (s_screen == SCREEN_MAIN && bsp_display_lock(pdMS_TO_TICKS(50))) {
-        update_ui_locked();
-        bsp_display_unlock();
-    }
 }
 
 static void encoder_adjust_power(int delta)
@@ -1241,17 +1867,11 @@ static void encoder_adjust_power(int delta)
 
     s_state.power_w = (uint8_t)p;
     ESP_LOGI(TAG, "Power encoder set %uW step=%uW", s_state.power_w, s_power_step);
-    aux_oled_show_current(true);
     const app_cmd_t cmd = {
         .type = CMD_SET_POWER,
         .value = (uint8_t)p,
     };
     send_cmd(&cmd);
-
-    if (s_screen == SCREEN_MAIN && bsp_display_lock(pdMS_TO_TICKS(50))) {
-        update_ui_locked();
-        bsp_display_unlock();
-    }
 }
 
 static void encoder_adjust_dnr(int delta)
@@ -1355,6 +1975,403 @@ static void encoder_width_default(void)
     encoder_set_width(width_default_for_mode(active_vfo_mode()), true);
 }
 
+static void set_noise_blanker_level(uint8_t level)
+{
+    if (level > NB_LEVEL_MAX) {
+        level = NB_LEVEL_MAX;
+    }
+    s_state.noise_blanker_level = level;
+    s_state.noise_blanker_on = level > 0;
+    const app_cmd_t cmd = {
+        .type = CMD_SET_NOISE_BLANKER_LEVEL,
+        .value = level,
+    };
+    send_cmd(&cmd);
+}
+
+static void adjust_noise_blanker(int delta)
+{
+    int level = s_state.noise_blanker_on ? s_state.noise_blanker_level : 0;
+    level += delta;
+    if (level < 0) {
+        level = 0;
+    } else if (level > NB_LEVEL_MAX) {
+        level = NB_LEVEL_MAX;
+    }
+    set_noise_blanker_level((uint8_t)level);
+}
+
+static void toggle_noise_blanker(void)
+{
+    s_state.noise_blanker_on = !s_state.noise_blanker_on;
+    if (s_state.noise_blanker_on && s_state.noise_blanker_level == 0) {
+        s_state.noise_blanker_level = 1;
+    }
+    const app_cmd_t cmd = {
+        .type = CMD_SET_NOISE_BLANKER,
+        .value = s_state.noise_blanker_on ? 1 : 0,
+    };
+    send_cmd(&cmd);
+}
+
+static void set_notch_value(uint8_t value)
+{
+    if (value > NOTCH_VALUE_MAX) {
+        value = NOTCH_VALUE_MAX;
+    }
+    s_state.notch_value = value;
+    s_state.notch_on = value > 0;
+    const app_cmd_t cmd = {
+        .type = CMD_SET_NOTCH,
+        .value = value,
+    };
+    send_cmd(&cmd);
+}
+
+static void adjust_notch(int delta)
+{
+    int value = s_state.notch_on ? s_state.notch_value : 0;
+    value += delta;
+    if (value < 0) {
+        value = 0;
+    } else if (value > NOTCH_VALUE_MAX) {
+        value = NOTCH_VALUE_MAX;
+    }
+    set_notch_value((uint8_t)value);
+}
+
+static void toggle_notch(void)
+{
+    if (s_state.notch_on) {
+        set_notch_value(0);
+    } else {
+        set_notch_value(s_state.notch_value > 0 ? s_state.notch_value : 50);
+    }
+}
+
+static void set_mic_gain(uint8_t gain)
+{
+    if (gain > MIC_GAIN_MAX) {
+        gain = MIC_GAIN_MAX;
+    }
+    s_state.mic_gain = gain;
+    const app_cmd_t cmd = {
+        .type = CMD_SET_MIC_GAIN,
+        .value = gain,
+    };
+    send_cmd(&cmd);
+}
+
+static void adjust_mic_gain(int delta)
+{
+    int gain = s_state.mic_gain + delta;
+    if (gain < 0) {
+        gain = 0;
+    } else if (gain > MIC_GAIN_MAX) {
+        gain = MIC_GAIN_MAX;
+    }
+    set_mic_gain((uint8_t)gain);
+}
+
+static void adjust_band(int delta)
+{
+    static const char *bands[] = {"3.5", "7", "14", "21", "28", "50"};
+    const uint32_t active_hz = s_state.active_vfo == 'B' ? s_state.vfo_b_hz : s_state.vfo_a_hz;
+    int nearest = 0;
+    uint32_t nearest_diff = UINT32_MAX;
+    for (int i = 0; i < (int)(sizeof(bands) / sizeof(bands[0])); ++i) {
+        const uint32_t hz = radio_state_band_default_hz(bands[i]);
+        const uint32_t diff = active_hz > hz ? active_hz - hz : hz - active_hz;
+        if (diff < nearest_diff) {
+            nearest = i;
+            nearest_diff = diff;
+        }
+    }
+    int next = nearest + delta;
+    if (next < 0) {
+        next = 0;
+    } else if (next >= (int)(sizeof(bands) / sizeof(bands[0]))) {
+        next = (int)(sizeof(bands) / sizeof(bands[0])) - 1;
+    }
+    const app_cmd_t cmd = {
+        .type = CMD_SET_BAND_FREQ,
+        .vfo = s_state.active_vfo,
+        .hz = radio_state_band_default_hz(bands[next]),
+    };
+    if (s_state.active_vfo == 'B') {
+        s_state.vfo_b_hz = cmd.hz;
+    } else {
+        s_state.vfo_a_hz = cmd.hz;
+    }
+    send_cmd(&cmd);
+}
+
+static void adjust_mode(int delta)
+{
+    static const ft710_mode_t modes[] = {FT710_MODE_LSB, FT710_MODE_USB, FT710_MODE_AM, FT710_MODE_FM,
+                                         FT710_MODE_DATA_U};
+    const ft710_mode_t current = s_input_target_vfo == 'B' ? s_state.mode_b : s_state.mode_a;
+    int index = 0;
+    for (int i = 0; i < (int)(sizeof(modes) / sizeof(modes[0])); ++i) {
+        if (modes[i] == current) {
+            index = i;
+            break;
+        }
+    }
+    index += delta;
+    if (index < 0) {
+        index = 0;
+    } else if (index >= (int)(sizeof(modes) / sizeof(modes[0]))) {
+        index = (int)(sizeof(modes) / sizeof(modes[0])) - 1;
+    }
+    const app_cmd_t cmd = {
+        .type = CMD_SET_MODE,
+        .vfo = s_input_target_vfo,
+        .mode = modes[index],
+    };
+    if (cmd.vfo == 'B') {
+        s_state.mode_b = cmd.mode;
+    } else {
+        s_state.mode_a = cmd.mode;
+    }
+    send_cmd(&cmd);
+}
+
+static void control_function_refresh_ui(control_slot_t *slot)
+{
+    if (slot) {
+        aux_oled_refresh_slot(slot, true);
+    } else {
+        aux_oled_show_current(true);
+    }
+    if (s_screen == SCREEN_MAIN && bsp_display_lock(pdMS_TO_TICKS(10))) {
+        update_ui_locked();
+        bsp_display_unlock();
+    }
+}
+
+static const feature_catalog_item_t *feature_catalog_find(control_function_t function)
+{
+    for (size_t i = 0; i < sizeof(s_feature_catalog) / sizeof(s_feature_catalog[0]); ++i) {
+        if (s_feature_catalog[i].function == function) {
+            return &s_feature_catalog[i];
+        }
+    }
+    return NULL;
+}
+
+static const char *control_function_name(control_function_t function)
+{
+    const feature_catalog_item_t *item = feature_catalog_find(function);
+    return item ? item->display : "UNKNOWN";
+}
+
+static int config_function_index(control_function_t function)
+{
+    for (int i = 0; i < CONFIG_FUNCTION_COUNT; ++i) {
+        if (s_config_functions[i] == function) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+static control_function_t config_function_or_default(control_function_t function)
+{
+    const int index = config_function_index(function);
+    return index >= 0 ? function : s_config_functions[0];
+}
+
+static void config_reset_selection(void)
+{
+    s_config_target_type = CONFIG_TARGET_NONE;
+    s_config_target_index = -1;
+    s_config_pending_function = s_config_functions[0];
+}
+
+static void config_select_target(config_target_type_t type, int index)
+{
+    s_config_target_type = type;
+    s_config_target_index = index;
+    if (type == CONFIG_TARGET_SLOT && index >= 0 && index < CONTROL_SLOT_COUNT) {
+        s_config_pending_function = config_function_or_default(s_control_slots[index].function);
+    } else if (type == CONFIG_TARGET_PANEL && index >= 0 && index < MAIN_PANEL_COUNT) {
+        s_config_pending_function = config_function_or_default(s_main_panel_functions[index]);
+    } else {
+        config_reset_selection();
+    }
+}
+
+static void config_apply_selection(void)
+{
+    if (s_config_target_type == CONFIG_TARGET_SLOT && s_config_target_index >= 0 &&
+        s_config_target_index < CONTROL_SLOT_COUNT) {
+        control_slot_set_function(s_config_target_index, s_config_pending_function);
+    } else if (s_config_target_type == CONFIG_TARGET_PANEL && s_config_target_index >= 0 &&
+               s_config_target_index < MAIN_PANEL_COUNT) {
+        s_main_panel_functions[s_config_target_index] = s_config_pending_function;
+    }
+    config_reset_selection();
+}
+
+static void control_slot_set_function(int index, control_function_t function)
+{
+    if (index < 0 || index >= CONTROL_SLOT_COUNT) {
+        return;
+    }
+
+    control_slot_t *slot = &s_control_slots[index];
+    slot->function = function;
+    aux_oled_invalidate(slot->oled);
+    ESP_LOGI(TAG, "config %s -> %s, OLED channel=%u", slot->name, control_function_name(slot->function),
+             slot->oled ? slot->oled->channel : 0);
+    aux_oled_refresh_slot(slot, true);
+}
+
+static void feature_value_text(control_function_t function, char *buf, size_t size)
+{
+    char title[12] = {};
+    feature_oled_text(function, title, sizeof(title), buf, size);
+}
+
+static uint8_t control_pin_mask(mcp_pin_t pin)
+{
+    return BIT(pin.bit);
+}
+
+static bool control_pin_released(mcp_pin_t pin, uint8_t gpioa, uint8_t gpiob)
+{
+    const uint8_t gpio = pin.port == MCP_PORT_A ? gpioa : gpiob;
+    return (gpio & control_pin_mask(pin)) != 0;
+}
+
+static uint8_t control_slot_ab(const control_slot_t *slot, uint8_t gpioa, uint8_t gpiob)
+{
+    const bool a_released = control_pin_released(slot->a, gpioa, gpiob);
+    const bool b_released = control_pin_released(slot->b, gpioa, gpiob);
+    if (slot->a_maps_to_bit1) {
+        return (uint8_t)((a_released ? BIT(1) : 0) | (b_released ? BIT(0) : 0));
+    }
+    return (uint8_t)((a_released ? BIT(0) : 0) | (b_released ? BIT(1) : 0));
+}
+
+static void control_slot_collect_masks(uint8_t *mask_a, uint8_t *mask_b)
+{
+    *mask_a = 0;
+    *mask_b = 0;
+    for (size_t i = 0; i < sizeof(s_control_slots) / sizeof(s_control_slots[0]); ++i) {
+        const control_slot_t *slot = &s_control_slots[i];
+        const mcp_pin_t pins[] = {slot->a, slot->b, slot->button};
+        for (size_t p = 0; p < sizeof(pins) / sizeof(pins[0]); ++p) {
+            if (pins[p].port == MCP_PORT_A) {
+                *mask_a |= control_pin_mask(pins[p]);
+            } else {
+                *mask_b |= control_pin_mask(pins[p]);
+            }
+        }
+    }
+}
+
+static void control_function_rotate(control_slot_t *slot, int delta)
+{
+    switch (slot->function) {
+    case CONTROL_FN_FREQUENCY:
+        encoder_adjust_input(delta);
+        break;
+    case CONTROL_FN_DNR:
+    case CONTROL_FN_DNR_LEVEL:
+        encoder_adjust_dnr(delta);
+        break;
+    case CONTROL_FN_POWER:
+        if (s_power_encoder_selecting_step) {
+            encoder_adjust_power_step(delta);
+        } else {
+            encoder_adjust_power(delta);
+        }
+        break;
+    case CONTROL_FN_WIDTH:
+        encoder_adjust_width(delta);
+        break;
+    case CONTROL_FN_BAND_SELECT:
+        adjust_band(delta);
+        break;
+    case CONTROL_FN_MODE:
+        adjust_mode(delta);
+        break;
+    case CONTROL_FN_NOISE_BLANKER:
+        adjust_noise_blanker(delta);
+        break;
+    case CONTROL_FN_MANUAL_NOTCH:
+        adjust_notch(delta);
+        break;
+    case CONTROL_FN_MIC_GAIN:
+        adjust_mic_gain(delta);
+        break;
+    case CONTROL_FN_SLOT_TEST:
+        s_slot5_value += delta;
+        ESP_LOGI(TAG, "%s slot test value=%d", slot->name, s_slot5_value);
+        aux_oled_show_slot5(true);
+        break;
+    default:
+        break;
+    }
+    control_function_refresh_ui(slot);
+}
+
+static void control_function_press(control_slot_t *slot)
+{
+    switch (slot->function) {
+    case CONTROL_FN_FREQUENCY:
+        if (s_screen == SCREEN_MAIN) {
+            submit_input_frequency();
+            if (bsp_display_lock(pdMS_TO_TICKS(50))) {
+                update_input_hint_locked();
+                bsp_display_unlock();
+            }
+        }
+        break;
+    case CONTROL_FN_DNR:
+    case CONTROL_FN_DNR_LEVEL:
+        encoder_dnr_off();
+        break;
+    case CONTROL_FN_POWER:
+        s_power_encoder_selecting_step = !s_power_encoder_selecting_step;
+        ESP_LOGI(TAG, "Power encoder %s step select, step=%uW",
+                 s_power_encoder_selecting_step ? "enter" : "exit", s_power_step);
+        control_function_refresh_ui(slot);
+        break;
+    case CONTROL_FN_WIDTH:
+        encoder_width_default();
+        break;
+    case CONTROL_FN_BAND_SELECT:
+        adjust_band(1);
+        control_function_refresh_ui(slot);
+        break;
+    case CONTROL_FN_MODE:
+        adjust_mode(1);
+        control_function_refresh_ui(slot);
+        break;
+    case CONTROL_FN_NOISE_BLANKER:
+        toggle_noise_blanker();
+        control_function_refresh_ui(slot);
+        break;
+    case CONTROL_FN_MANUAL_NOTCH:
+        toggle_notch();
+        control_function_refresh_ui(slot);
+        break;
+    case CONTROL_FN_MIC_GAIN:
+        control_function_refresh_ui(slot);
+        break;
+    case CONTROL_FN_SLOT_TEST:
+        s_slot5_value = 0;
+        ESP_LOGI(TAG, "%s slot test value reset", slot->name);
+        aux_oled_show_slot5(true);
+        break;
+    default:
+        break;
+    }
+}
+
 static esp_err_t mcp23017_write_reg(uint8_t reg, uint8_t value)
 {
     uint8_t data[2] = {reg, value};
@@ -1398,6 +2415,9 @@ static esp_err_t encoder_mcp23017_init(void)
     ESP_RETURN_ON_FALSE(bus, ESP_FAIL, TAG, "BSP I2C handle is null");
 
     const uint8_t candidates[] = {0x27, 0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26};
+    uint8_t slot_mask_a = 0;
+    uint8_t slot_mask_b = 0;
+    control_slot_collect_masks(&slot_mask_a, &slot_mask_b);
     esp_err_t last_err = ESP_ERR_NOT_FOUND;
     for (size_t i = 0; i < sizeof(candidates); ++i) {
         const uint8_t candidate = candidates[i];
@@ -1421,9 +2441,7 @@ static esp_err_t encoder_mcp23017_init(void)
                 iodira = 0xFF;
             }
             last_err = mcp23017_write_reg_retry(MCP23017_REG_IODIRA,
-                                                iodira | MCP23017_FREQ_ENCODER_MASK |
-                                                    MCP23017_DNR_ENCODER_MASK | MCP23017_POWER_ENCODER_A_MASK,
-                                                "IODIRA");
+                                                iodira | slot_mask_a, "IODIRA");
             if (last_err != ESP_OK) {
                 ESP_LOGW(TAG, "MCP23017 candidate 0x%02X rejected at IODIRA: %s", candidate,
                          esp_err_to_name(last_err));
@@ -1437,9 +2455,7 @@ static esp_err_t encoder_mcp23017_init(void)
                 gppua = 0;
             }
             last_err = mcp23017_write_reg_retry(MCP23017_REG_GPPUA,
-                                                gppua | MCP23017_FREQ_ENCODER_MASK |
-                                                    MCP23017_DNR_ENCODER_MASK | MCP23017_POWER_ENCODER_A_MASK,
-                                                "GPPUA");
+                                                gppua | slot_mask_a, "GPPUA");
             if (last_err != ESP_OK) {
                 ESP_LOGW(TAG, "MCP23017 candidate 0x%02X rejected at GPPUA: %s", candidate,
                          esp_err_to_name(last_err));
@@ -1453,9 +2469,7 @@ static esp_err_t encoder_mcp23017_init(void)
                 iodirb = 0xFF;
             }
             last_err = mcp23017_write_reg_retry(MCP23017_REG_IODIRB,
-                                                iodirb | MCP23017_POWER_ENCODER_B_MASK |
-                                                    MCP23017_WIDTH_ENCODER_B_MASK,
-                                                "IODIRB");
+                                                iodirb | slot_mask_b, "IODIRB");
             if (last_err != ESP_OK) {
                 ESP_LOGW(TAG, "MCP23017 candidate 0x%02X rejected at IODIRB: %s", candidate,
                          esp_err_to_name(last_err));
@@ -1469,9 +2483,7 @@ static esp_err_t encoder_mcp23017_init(void)
                 gppub = 0;
             }
             last_err = mcp23017_write_reg_retry(MCP23017_REG_GPPUB,
-                                                gppub | MCP23017_POWER_ENCODER_B_MASK |
-                                                    MCP23017_WIDTH_ENCODER_B_MASK,
-                                                "GPPUB");
+                                                gppub | slot_mask_b, "GPPUB");
             if (last_err != ESP_OK) {
                 ESP_LOGW(TAG, "MCP23017 candidate 0x%02X rejected at GPPUB: %s", candidate,
                          esp_err_to_name(last_err));
@@ -1480,9 +2492,13 @@ static esp_err_t encoder_mcp23017_init(void)
                 continue;
             }
 
-            ESP_LOGI(TAG,
-                     "MCP23017 encoder detected at 0x%02X, freq A=PA0 B=PA1 S=PA2 step=%lu Hz, dnr A=PA3 B=PA4 S=PA5, power A=PA6 B=PA7 S=PB0 step=%d W, width A=PB7 B=PB6 S=PB5",
-                     candidate, (unsigned long)ENCODER_STEP_HZ, s_power_step);
+            ESP_LOGI(TAG, "MCP23017 encoder detected at 0x%02X, slot_mask_a=0x%02X slot_mask_b=0x%02X",
+                     candidate, slot_mask_a, slot_mask_b);
+            for (size_t slot_i = 0; slot_i < sizeof(s_control_slots) / sizeof(s_control_slots[0]); ++slot_i) {
+                const control_slot_t *slot = &s_control_slots[slot_i];
+                ESP_LOGI(TAG, "%s function=%s OLED channel=%u", slot->name, control_function_name(slot->function),
+                         slot->oled ? slot->oled->channel : 0);
+            }
             return ESP_OK;
         }
     }
@@ -1502,38 +2518,25 @@ static void encoder_task(void *arg)
 
     uint8_t gpioa = 0xFF;
     uint8_t gpiob = 0xFF;
-    uint8_t prev_freq_ab = 0x03;
-    uint8_t prev_dnr_ab = 0x03;
-    uint8_t prev_power_ab = 0x03;
-    uint8_t prev_width_ab = 0x03;
-    if (mcp23017_read_reg(MCP23017_REG_GPIOA, &gpioa) == ESP_OK) {
-        prev_freq_ab = gpioa & 0x03;
-        prev_dnr_ab = (gpioa >> 3) & 0x03;
-        prev_power_ab = (gpioa >> 6) & 0x03;
+    if (mcp23017_read_reg(MCP23017_REG_GPIOA, &gpioa) != ESP_OK) {
+        gpioa = 0xFF;
     }
-    if (mcp23017_read_reg(MCP23017_REG_GPIOB, &gpiob) == ESP_OK) {
-        prev_width_ab = (uint8_t)(((gpiob & BIT(7)) ? BIT(1) : 0) | ((gpiob & BIT(6)) ? BIT(0) : 0));
-        ESP_LOGI(TAG,
-                 "MCP23017 initial GPIOA=0x%02X GPIOB=0x%02X freq_ab=%u dnr_ab=%u power_ab=%u width_ab=%u",
-                 gpioa, gpiob, prev_freq_ab, prev_dnr_ab, prev_power_ab, prev_width_ab);
+    if (mcp23017_read_reg(MCP23017_REG_GPIOB, &gpiob) != ESP_OK) {
+        gpiob = 0xFF;
     }
 
-    bool stable_freq_button = true;
-    bool last_freq_button_sample = true;
-    bool stable_dnr_button = true;
-    bool last_dnr_button_sample = true;
-    bool stable_power_button = true;
-    bool last_power_button_sample = true;
-    bool stable_width_button = true;
-    bool last_width_button_sample = true;
-    TickType_t last_freq_button_change = xTaskGetTickCount();
-    TickType_t last_dnr_button_change = xTaskGetTickCount();
-    TickType_t last_power_button_change = xTaskGetTickCount();
-    TickType_t last_width_button_change = xTaskGetTickCount();
-    int8_t freq_quad_accum = 0;
-    int8_t dnr_quad_accum = 0;
-    int8_t power_quad_accum = 0;
-    int8_t width_quad_accum = 0;
+    const TickType_t start = xTaskGetTickCount();
+    for (size_t i = 0; i < sizeof(s_control_slots) / sizeof(s_control_slots[0]); ++i) {
+        control_slot_t *slot = &s_control_slots[i];
+        slot->prev_ab = control_slot_ab(slot, gpioa, gpiob);
+        slot->quad_accum = 0;
+        slot->stable_button = control_pin_released(slot->button, gpioa, gpiob);
+        slot->last_button_sample = slot->stable_button;
+        slot->last_button_change = start;
+        ESP_LOGI(TAG, "%s initial ab=%u button=%s", slot->name, slot->prev_ab,
+                 slot->stable_button ? "released" : "pressed");
+    }
+
     const int8_t quad_table[16] = {
         0, -1, 1, 0,
         1, 0, 0, -1,
@@ -1542,134 +2545,36 @@ static void encoder_task(void *arg)
     };
 
     while (true) {
-        if (mcp23017_read_reg(MCP23017_REG_GPIOA, &gpioa) == ESP_OK) {
-            const uint8_t freq_ab = gpioa & 0x03;
-            if (freq_ab != prev_freq_ab) {
-                freq_quad_accum += quad_table[(prev_freq_ab << 2) | freq_ab];
-                prev_freq_ab = freq_ab;
-                if (freq_quad_accum >= 4) {
-                    encoder_adjust_input(1);
-                    freq_quad_accum = 0;
-                } else if (freq_quad_accum <= -4) {
-                    encoder_adjust_input(-1);
-                    freq_quad_accum = 0;
-                }
-            }
-
-            const uint8_t dnr_ab = (gpioa >> 3) & 0x03;
-            if (dnr_ab != prev_dnr_ab) {
-                dnr_quad_accum += quad_table[(prev_dnr_ab << 2) | dnr_ab];
-                prev_dnr_ab = dnr_ab;
-                if (dnr_quad_accum >= 4) {
-                    encoder_adjust_dnr(1);
-                    dnr_quad_accum = 0;
-                } else if (dnr_quad_accum <= -4) {
-                    encoder_adjust_dnr(-1);
-                    dnr_quad_accum = 0;
-                }
-            }
-
-            const uint8_t power_ab = (gpioa >> 6) & 0x03;
-            if (power_ab != prev_power_ab) {
-                power_quad_accum += quad_table[(prev_power_ab << 2) | power_ab];
-                prev_power_ab = power_ab;
-                if (power_quad_accum >= 4) {
-                    if (s_power_encoder_selecting_step) {
-                        encoder_adjust_power_step(1);
-                    } else {
-                        encoder_adjust_power(1);
-                    }
-                    power_quad_accum = 0;
-                } else if (power_quad_accum <= -4) {
-                    if (s_power_encoder_selecting_step) {
-                        encoder_adjust_power_step(-1);
-                    } else {
-                        encoder_adjust_power(-1);
-                    }
-                    power_quad_accum = 0;
-                }
-            }
-
-            const bool dnr_button_released = (gpioa & BIT(5)) != 0;
-            const TickType_t dnr_now = xTaskGetTickCount();
-            if (dnr_button_released != last_dnr_button_sample) {
-                last_dnr_button_sample = dnr_button_released;
-                last_dnr_button_change = dnr_now;
-            }
-            if ((dnr_now - last_dnr_button_change) >= pdMS_TO_TICKS(35) &&
-                dnr_button_released != stable_dnr_button) {
-                stable_dnr_button = dnr_button_released;
-                if (!stable_dnr_button) {
-                    dnr_quad_accum = 0;
-                    encoder_dnr_off();
-                }
-            }
-
-            const bool freq_button_released = (gpioa & BIT(2)) != 0;
+        const bool got_a = mcp23017_read_reg(MCP23017_REG_GPIOA, &gpioa) == ESP_OK;
+        const bool got_b = mcp23017_read_reg(MCP23017_REG_GPIOB, &gpiob) == ESP_OK;
+        if (got_a && got_b) {
             const TickType_t now = xTaskGetTickCount();
-            if (freq_button_released != last_freq_button_sample) {
-                last_freq_button_sample = freq_button_released;
-                last_freq_button_change = now;
-            }
-            if ((now - last_freq_button_change) >= pdMS_TO_TICKS(35) &&
-                freq_button_released != stable_freq_button) {
-                stable_freq_button = freq_button_released;
-                if (!stable_freq_button && s_screen == SCREEN_MAIN) {
-                    submit_input_frequency();
-                    if (bsp_display_lock(pdMS_TO_TICKS(50))) {
-                        update_input_hint_locked();
-                        bsp_display_unlock();
+            for (size_t i = 0; i < sizeof(s_control_slots) / sizeof(s_control_slots[0]); ++i) {
+                control_slot_t *slot = &s_control_slots[i];
+                const uint8_t ab = control_slot_ab(slot, gpioa, gpiob);
+                if (ab != slot->prev_ab) {
+                    slot->quad_accum += quad_table[(slot->prev_ab << 2) | ab];
+                    slot->prev_ab = ab;
+                    if (slot->quad_accum >= 4) {
+                        control_function_rotate(slot, 1);
+                        slot->quad_accum = 0;
+                    } else if (slot->quad_accum <= -4) {
+                        control_function_rotate(slot, -1);
+                        slot->quad_accum = 0;
                     }
                 }
-            }
-        }
-        if (mcp23017_read_reg(MCP23017_REG_GPIOB, &gpiob) == ESP_OK) {
-            const uint8_t width_ab = (uint8_t)(((gpiob & BIT(7)) ? BIT(1) : 0) | ((gpiob & BIT(6)) ? BIT(0) : 0));
-            if (width_ab != prev_width_ab) {
-                width_quad_accum += quad_table[(prev_width_ab << 2) | width_ab];
-                prev_width_ab = width_ab;
-                if (width_quad_accum >= 4) {
-                    encoder_adjust_width(1);
-                    width_quad_accum = 0;
-                } else if (width_quad_accum <= -4) {
-                    encoder_adjust_width(-1);
-                    width_quad_accum = 0;
-                }
-            }
 
-            const bool width_button_released = (gpiob & BIT(5)) != 0;
-            const TickType_t width_now = xTaskGetTickCount();
-            if (width_button_released != last_width_button_sample) {
-                last_width_button_sample = width_button_released;
-                last_width_button_change = width_now;
-            }
-            if ((width_now - last_width_button_change) >= pdMS_TO_TICKS(35) &&
-                width_button_released != stable_width_button) {
-                stable_width_button = width_button_released;
-                if (!stable_width_button) {
-                    width_quad_accum = 0;
-                    encoder_width_default();
+                const bool button_released = control_pin_released(slot->button, gpioa, gpiob);
+                if (button_released != slot->last_button_sample) {
+                    slot->last_button_sample = button_released;
+                    slot->last_button_change = now;
                 }
-            }
-
-            const bool power_button_released = (gpiob & BIT(0)) != 0;
-            const TickType_t now = xTaskGetTickCount();
-            if (power_button_released != last_power_button_sample) {
-                last_power_button_sample = power_button_released;
-                last_power_button_change = now;
-            }
-            if ((now - last_power_button_change) >= pdMS_TO_TICKS(35) &&
-                power_button_released != stable_power_button) {
-                stable_power_button = power_button_released;
-                if (!stable_power_button) {
-                    s_power_encoder_selecting_step = !s_power_encoder_selecting_step;
-                    power_quad_accum = 0;
-                    ESP_LOGI(TAG, "Power encoder %s step select, step=%uW",
-                             s_power_encoder_selecting_step ? "enter" : "exit", s_power_step);
-                    aux_oled_show_current(true);
-                    if (s_screen == SCREEN_MAIN && bsp_display_lock(pdMS_TO_TICKS(50))) {
-                        update_ui_locked();
-                        bsp_display_unlock();
+                if ((now - slot->last_button_change) >= pdMS_TO_TICKS(35) &&
+                    button_released != slot->stable_button) {
+                    slot->stable_button = button_released;
+                    if (!slot->stable_button) {
+                        slot->quad_accum = 0;
+                        control_function_press(slot);
                     }
                 }
             }
@@ -1696,6 +2601,21 @@ static void aux_oled_task(void *arg)
     }
 }
 
+static void handle_feature_panel_action(int panel, const char *action)
+{
+    if (panel < 0 || panel >= MAIN_PANEL_COUNT || !action) {
+        return;
+    }
+    const control_function_t function = s_main_panel_functions[panel];
+    if (strcmp(action, "MINUS") == 0) {
+        control_function_rotate(&(control_slot_t){.name = "panel", .function = function}, -1);
+    } else if (strcmp(action, "PLUS") == 0) {
+        control_function_rotate(&(control_slot_t){.name = "panel", .function = function}, 1);
+    } else if (strcmp(action, "TOGGLE") == 0) {
+        control_function_press(&(control_slot_t){.name = "panel", .function = function});
+    }
+}
+
 static void button_event_cb(lv_event_t *e)
 {
     const char *id = (const char *)lv_event_get_user_data(e);
@@ -1711,6 +2631,14 @@ static void button_event_cb(lv_event_t *e)
     if (strcmp(id, "NAV_WIFI") == 0) {
         if (bsp_display_lock(pdMS_TO_TICKS(100))) {
             create_wifi_ui();
+            bsp_display_unlock();
+        }
+        return;
+    }
+    if (strcmp(id, "NAV_CONFIG") == 0) {
+        config_reset_selection();
+        if (bsp_display_lock(pdMS_TO_TICKS(100))) {
+            create_config_ui();
             bsp_display_unlock();
         }
         return;
@@ -1753,6 +2681,47 @@ static void button_event_cb(lv_event_t *e)
                 create_wifi_ui();
                 bsp_display_unlock();
             }
+        }
+        return;
+    }
+    if (s_screen == SCREEN_CONFIG) {
+        if (strncmp(id, "CFG_SLOT_", 9) == 0) {
+            const int index = atoi(id + 9);
+            if (index >= 0 && index < CONTROL_SLOT_COUNT) {
+                config_select_target(CONFIG_TARGET_SLOT, index);
+                if (bsp_display_lock(pdMS_TO_TICKS(100))) {
+                    create_config_ui();
+                    bsp_display_unlock();
+                }
+            }
+            return;
+        }
+        if (strncmp(id, "CFG_PANEL_", 10) == 0) {
+            const int index = atoi(id + 10);
+            if (index >= 0 && index < MAIN_PANEL_COUNT) {
+                config_select_target(CONFIG_TARGET_PANEL, index);
+                if (bsp_display_lock(pdMS_TO_TICKS(100))) {
+                    create_config_ui();
+                    bsp_display_unlock();
+                }
+            }
+            return;
+        }
+        if (strcmp(id, "CFG_APPLY") == 0) {
+            config_apply_selection();
+            if (bsp_display_lock(pdMS_TO_TICKS(100))) {
+                create_config_ui();
+                bsp_display_unlock();
+            }
+            return;
+        }
+        if (strcmp(id, "CFG_CANCEL") == 0) {
+            config_reset_selection();
+            if (bsp_display_lock(pdMS_TO_TICKS(100))) {
+                create_config_ui();
+                bsp_display_unlock();
+            }
+            return;
         }
         return;
     }
@@ -1856,6 +2825,10 @@ static void button_event_cb(lv_event_t *e)
             s_state.vfo_a_hz = cmd.hz;
         }
         send_cmd(&cmd);
+    } else if (strncmp(id, "FP", 2) == 0) {
+        const int panel = atoi(id + 2);
+        const char *action = strchr(id, '_');
+        handle_feature_panel_action(panel, action ? action + 1 : "");
     }
 
     if (bsp_display_lock(pdMS_TO_TICKS(50))) {
@@ -1949,6 +2922,7 @@ static void create_top_bar(lv_obj_t *scr, bool show_back)
         button(scr, "BACK", "BACK_MAIN", 908, 12, 92, 25, &lv_font_montserrat_14);
     } else {
         label(scr, "MENU", 944, 15, &lv_font_montserrat_14, C_MUTED);
+        touch_zone(scr, "NAV_CONFIG", 920, 6, 88, 36);
     }
 }
 
@@ -1963,8 +2937,11 @@ static void update_ui_locked(void)
             lv_label_set_text(s_wifi_dns_label, s_wifi_dns);
             lv_label_set_text(s_wifi_page_status_label, wifi_page_status_text());
             lv_obj_set_style_text_color(s_wifi_page_status_label,
-                                        s_wifi_state == WIFI_STATE_ONLINE ? C_CYAN : C_MUTED, LV_PART_MAIN);
+                                                s_wifi_state == WIFI_STATE_ONLINE ? C_CYAN : C_MUTED, LV_PART_MAIN);
         }
+        return;
+    }
+    if (!s_freq_a || !s_freq_b) {
         return;
     }
 
@@ -1989,11 +2966,17 @@ static void update_ui_locked(void)
     } else {
         snprintf(buf, sizeof(buf), "%uW", s_state.power_w);
     }
-    lv_label_set_text(s_power_label, buf);
+    if (s_power_label) {
+        lv_label_set_text(s_power_label, buf);
+    }
     snprintf(buf, sizeof(buf), "%02u", s_state.dnr_on ? s_state.dnr_level : 0);
-    lv_label_set_text(s_dnr_label, s_state.dnr_on ? buf : "OFF");
+    if (s_dnr_label) {
+        lv_label_set_text(s_dnr_label, s_state.dnr_on ? buf : "OFF");
+    }
     snprintf(buf, sizeof(buf), "RL%03u", s_state.dnr_level);
-    lv_label_set_text(s_dnr_cmd_label, buf);
+    if (s_dnr_cmd_label) {
+        lv_label_set_text(s_dnr_cmd_label, buf);
+    }
 
     lv_label_set_text(s_cat_status, s_state.online ? "CAT ONLINE" : "CAT WAIT");
     lv_label_set_text(s_wifi_status, wifi_state_text());
@@ -2004,17 +2987,21 @@ static void update_ui_locked(void)
                                                 s_wifi_state == WIFI_STATE_SCANNING);
     set_button_active(lv_obj_get_parent(s_rx_status), true);
 
-    set_button_active(s_power_step_btns[0], s_power_step == 2);
-    set_button_active(s_power_step_btns[1], s_power_step == 5);
-    set_button_active(s_power_step_btns[2], s_power_step == 10);
+    if (s_power_step_btns[0]) set_button_active(s_power_step_btns[0], s_power_step == 2);
+    if (s_power_step_btns[1]) set_button_active(s_power_step_btns[1], s_power_step == 5);
+    if (s_power_step_btns[2]) set_button_active(s_power_step_btns[2], s_power_step == 10);
     for (int i = 0; i < 3; ++i) {
-        lv_obj_set_style_border_width(s_power_step_btns[i], s_power_encoder_selecting_step ? 3 : 1, LV_PART_MAIN);
+        if (s_power_step_btns[i]) {
+            lv_obj_set_style_border_width(s_power_step_btns[i], s_power_encoder_selecting_step ? 3 : 1, LV_PART_MAIN);
+        }
     }
 
     ft710_mode_t active_mode = s_input_target_vfo == 'B' ? s_state.mode_b : s_state.mode_a;
     const ft710_mode_t modes[5] = {FT710_MODE_LSB, FT710_MODE_USB, FT710_MODE_FM, FT710_MODE_AM, FT710_MODE_DATA_U};
     for (int i = 0; i < 5; ++i) {
-        set_button_active(s_mode_btns[i], active_mode == modes[i]);
+        if (s_mode_btns[i]) {
+            set_button_active(s_mode_btns[i], active_mode == modes[i]);
+        }
     }
 
     const uint32_t active_hz = s_state.active_vfo == 'B' ? s_state.vfo_b_hz : s_state.vfo_a_hz;
@@ -2022,13 +3009,21 @@ static void update_ui_locked(void)
     for (int i = 0; i < 6; ++i) {
         uint32_t low = bands[i] > 500000 ? bands[i] - 500000 : 0;
         uint32_t high = bands[i] + 500000;
-        set_button_active(s_band_btns[i], active_hz >= low && active_hz <= high);
+        if (s_band_btns[i]) {
+            set_button_active(s_band_btns[i], active_hz >= low && active_hz <= high);
+        }
+    }
+    for (int i = 0; i < MAIN_PANEL_COUNT; ++i) {
+        if (s_panel_value_labels[i]) {
+            feature_value_text(s_main_panel_functions[i], buf, sizeof(buf));
+            lv_label_set_text(s_panel_value_labels[i], buf);
+        }
     }
 }
 
 static void update_ui(void)
 {
-    if (bsp_display_lock(pdMS_TO_TICKS(100))) {
+    if (bsp_display_lock(pdMS_TO_TICKS(10))) {
         update_ui_locked();
         bsp_display_unlock();
     }
@@ -2038,6 +3033,7 @@ static void create_wifi_ui(void)
 {
     s_screen = SCREEN_WIFI;
     lv_obj_t *scr = lv_scr_act();
+    reset_ui_refs();
     lv_obj_clean(scr);
     lv_obj_set_style_bg_color(scr, C_BG, LV_PART_MAIN);
     lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, LV_PART_MAIN);
@@ -2113,6 +3109,7 @@ static void create_wifi_keyboard_ui(void)
 {
     s_screen = SCREEN_WIFI_KEYBOARD;
     lv_obj_t *scr = lv_scr_act();
+    reset_ui_refs();
     lv_obj_clean(scr);
     lv_obj_set_style_bg_color(scr, C_BG, LV_PART_MAIN);
     lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, LV_PART_MAIN);
@@ -2171,10 +3168,199 @@ static void create_wifi_keyboard_ui(void)
     update_ui_locked();
 }
 
+static const char *config_target_title(void)
+{
+    if (s_config_target_type == CONFIG_TARGET_SLOT && s_config_target_index >= 0 &&
+        s_config_target_index < CONTROL_SLOT_COUNT) {
+        static char slot_title[24];
+        snprintf(slot_title, sizeof(slot_title), "GROUP %d", s_config_target_index + 1);
+        return slot_title;
+    }
+    if (s_config_target_type == CONFIG_TARGET_PANEL && s_config_target_index >= 0 &&
+        s_config_target_index < MAIN_PANEL_COUNT) {
+        static char panel_title[24];
+        snprintf(panel_title, sizeof(panel_title), "PANEL %d", s_config_target_index + 1);
+        return panel_title;
+    }
+    return "NO TARGET";
+}
+
+static bool config_has_selection(void)
+{
+    return (s_config_target_type == CONFIG_TARGET_SLOT && s_config_target_index >= 0 &&
+            s_config_target_index < CONTROL_SLOT_COUNT) ||
+           (s_config_target_type == CONFIG_TARGET_PANEL && s_config_target_index >= 0 &&
+            s_config_target_index < MAIN_PANEL_COUNT);
+}
+
+static void config_roller_event_cb(lv_event_t *e)
+{
+    if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) {
+        return;
+    }
+    lv_obj_t *roller = lv_event_get_target(e);
+    const uint16_t selected = lv_roller_get_selected(roller);
+    if (selected < CONFIG_FUNCTION_COUNT) {
+        s_config_pending_function = s_config_functions[selected];
+    }
+}
+
+static void create_config_picker(lv_obj_t *scr)
+{
+    box(scr, 210, 74, 604, 486, C_PANEL);
+    label(scr, "SELECT FUNCTION", 238, 96, &lv_font_montserrat_24, C_TEXT);
+    label(scr, config_target_title(), 654, 104, &lv_font_montserrat_16, C_CYAN);
+
+    char options[160] = {};
+    size_t pos = 0;
+    for (int i = 0; i < CONFIG_FUNCTION_COUNT; ++i) {
+        const int written = snprintf(options + pos, sizeof(options) - pos, "%s%s", i == 0 ? "" : "\n",
+                                     control_function_name(s_config_functions[i]));
+        if (written < 0 || (size_t)written >= sizeof(options) - pos) {
+            break;
+        }
+        pos += (size_t)written;
+    }
+
+    lv_obj_t *roller = lv_roller_create(scr);
+    lv_obj_set_pos(roller, 238, 144);
+    lv_obj_set_size(roller, 548, 286);
+    lv_roller_set_options(roller, options, LV_ROLLER_MODE_NORMAL);
+    lv_roller_set_visible_row_count(roller, 5);
+    const int selected = config_function_index(s_config_pending_function);
+    lv_roller_set_selected(roller, selected >= 0 ? selected : 0, LV_ANIM_OFF);
+    lv_obj_set_style_bg_color(roller, C_BG, LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(roller, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_border_color(roller, C_BORDER, LV_PART_MAIN);
+    lv_obj_set_style_border_width(roller, 1, LV_PART_MAIN);
+    lv_obj_set_style_radius(roller, 8, LV_PART_MAIN);
+    lv_obj_set_style_text_font(roller, &lv_font_montserrat_28, LV_PART_MAIN);
+    lv_obj_set_style_text_color(roller, C_MUTED, LV_PART_MAIN);
+    lv_obj_set_style_text_align(roller, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(roller, C_BTN_ACTIVE, LV_PART_SELECTED);
+    lv_obj_set_style_bg_opa(roller, LV_OPA_COVER, LV_PART_SELECTED);
+    lv_obj_set_style_text_color(roller, C_CYAN, LV_PART_SELECTED);
+    lv_obj_set_style_text_font(roller, &lv_font_montserrat_32, LV_PART_SELECTED);
+    lv_obj_add_event_cb(roller, config_roller_event_cb, LV_EVENT_VALUE_CHANGED, NULL);
+
+    button(scr, "CANCEL", "CFG_CANCEL", 238, 472, 254, 56, &lv_font_montserrat_18);
+    lv_obj_t *apply_btn = button(scr, "APPLY", "CFG_APPLY", 532, 472, 254, 56, &lv_font_montserrat_18);
+    set_button_active(apply_btn, true);
+}
+
+static void create_config_ui(void)
+{
+    s_screen = SCREEN_CONFIG;
+    lv_obj_t *scr = lv_scr_act();
+    reset_ui_refs();
+    lv_obj_clean(scr);
+    lv_obj_set_style_bg_color(scr, C_BG, LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_clear_flag(scr, LV_OBJ_FLAG_SCROLLABLE);
+
+    create_top_bar(scr, true);
+
+    box(scr, 8, 52, 1008, 252, C_PANEL);
+    label(scr, "KNOB + OLED SLOTS", 24, 72, &lv_font_montserrat_24, C_TEXT);
+    label(scr, "TOUCH A SLOT TO CONFIGURE", 718, 80, &lv_font_montserrat_14, C_MUTED);
+    for (int i = 0; i < CONTROL_SLOT_COUNT; ++i) {
+        const control_slot_t *slot = &s_control_slots[i];
+        char text[96] = {};
+        snprintf(text, sizeof(text), "GROUP %d\n%s", i + 1, control_function_name(slot->function));
+        const int x = 28 + i * 194;
+        lv_obj_t *btn = button(scr, text, s_config_slot_ids[i], x, 124, 176, 118, &lv_font_montserrat_20);
+        s_config_slot_btns[i] = btn;
+        if (s_config_target_type == CONFIG_TARGET_SLOT && s_config_target_index == i) {
+            set_button_active(btn, true);
+        }
+        char pin_text[48] = {};
+        snprintf(pin_text, sizeof(pin_text), "%s  OLED CH%u", slot->name, slot->oled ? slot->oled->channel : 0);
+        label(scr, pin_text, x + 12, 254, &lv_font_montserrat_14, C_MUTED);
+    }
+
+    box(scr, 8, 322, 1008, 270, C_PANEL);
+    label(scr, "MAIN SCREEN PANELS", 24, 342, &lv_font_montserrat_24, C_TEXT);
+    label(scr, "TOUCH A PANEL TO CONFIGURE", 724, 350, &lv_font_montserrat_14, C_MUTED);
+    for (int i = 0; i < MAIN_PANEL_COUNT; ++i) {
+        char text[96] = {};
+        snprintf(text, sizeof(text), "PANEL %d\n%s", i + 1, control_function_name(s_main_panel_functions[i]));
+        const int x = 28 + (i % 4) * 244;
+        lv_obj_t *btn = button(scr, text, s_config_panel_ids[i], x, 398, 224, 112, &lv_font_montserrat_20);
+        s_config_panel_btns[i] = btn;
+        if (s_config_target_type == CONFIG_TARGET_PANEL && s_config_target_index == i) {
+            set_button_active(btn, true);
+        }
+    }
+
+    label(scr, "AVAILABLE NOW: WIDTH / RF PWR / DNR / BAND / MODE / NB / NTCH / MIC LVL", 36, 548,
+          &lv_font_montserrat_14, C_CYAN);
+    if (config_has_selection()) {
+        create_config_picker(scr);
+    }
+    update_ui_locked();
+}
+
+static void create_feature_panel(lv_obj_t *scr, int panel, control_function_t function, int x, int y, int w, int h)
+{
+    box(scr, x, y, w, h, C_PANEL);
+    label(scr, control_function_name(function), x + 16, y + 18, &lv_font_montserrat_16, C_TEXT);
+    const feature_catalog_item_t *item = feature_catalog_find(function);
+    label(scr, item && item->cat_cmd ? item->cat_cmd : "--", x + w - 64, y + 20, &lv_font_montserrat_14, C_MUTED);
+
+    if (function == CONTROL_FN_POWER) {
+        s_power_step_btns[0] = button(scr, "2W", "P2", x + 18, y + 52, 80, 48, &lv_font_montserrat_18);
+        s_power_step_btns[1] = button(scr, "5W", "P5", x + 104, y + 52, 80, 48, &lv_font_montserrat_18);
+        s_power_step_btns[2] = button(scr, "10W", "P10", x + 190, y + 52, 80, 48, &lv_font_montserrat_18);
+        s_power_label = label(scr, "46W", x + 78, y + 118, &lv_font_montserrat_48, C_TEXT);
+        button(scr, "-", "P-", x + 18, y + h - 66, 122, 50, &lv_font_montserrat_36);
+        button(scr, "+", "P+", x + 150, y + h - 66, 122, 50, &lv_font_montserrat_36);
+        return;
+    }
+
+    if (function == CONTROL_FN_DNR || function == CONTROL_FN_DNR_LEVEL) {
+        s_dnr_cmd_label = label(scr, "RL000", x + w - 72, y + 20, &lv_font_montserrat_14, C_MUTED);
+        button(scr, "-", "D-", x + 16, y + 60, 76, h - 88, &lv_font_montserrat_40);
+        s_dnr_label = label(scr, "OFF", x + 104, y + 116, &lv_font_montserrat_40, C_CYAN);
+        label(scr, "DNR LEVEL", x + 108, y + h - 86, &lv_font_montserrat_14, C_MUTED);
+        button(scr, "+", "D+", x + w - 92, y + 60, 76, h - 88, &lv_font_montserrat_40);
+        return;
+    }
+
+    if (function == CONTROL_FN_MODE) {
+        s_mode_btns[0] = button(scr, "LSB", "M_LSB", x + 18, y + 56, 122, 58, &lv_font_montserrat_24);
+        s_mode_btns[1] = button(scr, "USB", "M_USB", x + 150, y + 56, 122, 58, &lv_font_montserrat_24);
+        s_mode_btns[2] = button(scr, "FM", "M_FM", x + 18, y + 124, 122, 58, &lv_font_montserrat_24);
+        s_mode_btns[3] = button(scr, "AM", "M_AM", x + 150, y + 124, 122, 58, &lv_font_montserrat_24);
+        s_mode_btns[4] = button(scr, "DATA-U", "M_DATA", x + 18, y + 192, 254, 50, &lv_font_montserrat_24);
+        return;
+    }
+
+    if (function == CONTROL_FN_BAND_SELECT) {
+        label(scr, "MHz", x + w - 48, y + 20, &lv_font_montserrat_14, C_MUTED);
+        const char *band_txt[6] = {"3.5", "7", "14", "21", "28", "50"};
+        const char *band_id[6] = {"B_3.5", "B_7", "B_14", "B_21", "B_28", "B_50"};
+        for (int i = 0; i < 6; ++i) {
+            const int col = i % 3;
+            const int row = i / 3;
+            s_band_btns[i] = button(scr, band_txt[i], band_id[i], x + 16 + col * 90, y + 56 + row * 94, 80, 74,
+                                    &lv_font_montserrat_32);
+        }
+        return;
+    }
+
+    char value[16] = {};
+    feature_value_text(function, value, sizeof(value));
+    s_panel_value_labels[panel] = label(scr, value, x + 84, y + 100, &lv_font_montserrat_40, C_CYAN);
+    button(scr, "-", s_panel_minus_ids[panel], x + 18, y + h - 72, 86, 54, &lv_font_montserrat_36);
+    button(scr, "+", s_panel_plus_ids[panel], x + w - 104, y + h - 72, 86, 54, &lv_font_montserrat_36);
+    button(scr, "TOGGLE", s_panel_toggle_ids[panel], x + 116, y + h - 72, w - 232, 54, &lv_font_montserrat_18);
+}
+
 static void create_ui(void)
 {
     s_screen = SCREEN_MAIN;
     lv_obj_t *scr = lv_scr_act();
+    reset_ui_refs();
     lv_obj_clean(scr);
     lv_obj_set_style_bg_color(scr, C_BG, LV_PART_MAIN);
     lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, LV_PART_MAIN);
@@ -2219,43 +3405,10 @@ static void create_ui(void)
     button(scr, "CLR", "CLR", 22, 540, 178, 44, &lv_font_montserrat_18);
     button(scr, "ENTER / SET", "SET", 208, 540, 176, 44, &lv_font_montserrat_18);
 
-    const int rx = 420;
-    box(scr, rx, 52, 286, 266, C_PANEL);
-    label(scr, "RF POWER", rx + 16, 70, &lv_font_montserrat_16, C_TEXT);
-    label(scr, "PC COMMAND", rx + 188, 72, &lv_font_montserrat_14, C_MUTED);
-    s_power_step_btns[0] = button(scr, "2W", "P2", rx + 18, 104, 80, 48, &lv_font_montserrat_18);
-    s_power_step_btns[1] = button(scr, "5W", "P5", rx + 104, 104, 80, 48, &lv_font_montserrat_18);
-    s_power_step_btns[2] = button(scr, "10W", "P10", rx + 190, 104, 80, 48, &lv_font_montserrat_18);
-    s_power_label = label(scr, "46W", rx + 78, 170, &lv_font_montserrat_48, C_TEXT);
-    button(scr, "-", "P-", rx + 18, 252, 122, 50, &lv_font_montserrat_36);
-    button(scr, "+", "P+", rx + 150, 252, 122, 50, &lv_font_montserrat_36);
-
-    box(scr, 718, 52, 298, 266, C_PANEL);
-    label(scr, "DNR", 734, 70, &lv_font_montserrat_16, C_TEXT);
-    s_dnr_cmd_label = label(scr, "RL000", 946, 72, &lv_font_montserrat_14, C_MUTED);
-    button(scr, "-", "D-", 734, 112, 76, 188, &lv_font_montserrat_40);
-    s_dnr_label = label(scr, "OFF", 822, 168, &lv_font_montserrat_40, C_CYAN);
-    label(scr, "DNR LEVEL", 826, 232, &lv_font_montserrat_14, C_MUTED);
-    button(scr, "+", "D+", 924, 112, 76, 188, &lv_font_montserrat_40);
-
-    box(scr, rx, 330, 286, 262, C_PANEL);
-    label(scr, "MODE", rx + 16, 348, &lv_font_montserrat_16, C_TEXT);
-    s_mode_btns[0] = button(scr, "LSB", "M_LSB", rx + 18, 386, 122, 58, &lv_font_montserrat_24);
-    s_mode_btns[1] = button(scr, "USB", "M_USB", rx + 150, 386, 122, 58, &lv_font_montserrat_24);
-    s_mode_btns[2] = button(scr, "FM", "M_FM", rx + 18, 454, 122, 58, &lv_font_montserrat_24);
-    s_mode_btns[3] = button(scr, "AM", "M_AM", rx + 150, 454, 122, 58, &lv_font_montserrat_24);
-    s_mode_btns[4] = button(scr, "DATA-U", "M_DATA", rx + 18, 522, 254, 50, &lv_font_montserrat_24);
-
-    box(scr, 718, 330, 298, 262, C_PANEL);
-    label(scr, "BAND", 734, 348, &lv_font_montserrat_16, C_TEXT);
-    label(scr, "MHz", 968, 350, &lv_font_montserrat_14, C_MUTED);
-    const char *band_txt[6] = {"3.5", "7", "14", "21", "28", "50"};
-    const char *band_id[6] = {"B_3.5", "B_7", "B_14", "B_21", "B_28", "B_50"};
-    for (int i = 0; i < 6; ++i) {
-        int col = i % 3;
-        int row = i / 3;
-        s_band_btns[i] = button(scr, band_txt[i], band_id[i], 734 + col * 90, 386 + row * 94, 80, 74, &lv_font_montserrat_32);
-    }
+    create_feature_panel(scr, 0, s_main_panel_functions[0], 420, 52, 286, 266);
+    create_feature_panel(scr, 1, s_main_panel_functions[1], 718, 52, 298, 266);
+    create_feature_panel(scr, 2, s_main_panel_functions[2], 420, 330, 286, 262);
+    create_feature_panel(scr, 3, s_main_panel_functions[3], 718, 330, 298, 262);
 
     update_ui_locked();
 }
@@ -2335,6 +3488,43 @@ static void apply_command(cdc_acm_dev_hdl_t dev, app_cmd_t *cmd)
         break;
     case CMD_SET_BAND_FREQ:
         snprintf(out, sizeof(out), "F%c%09lu;", cmd->vfo, (unsigned long)cmd->hz);
+        err = cat_send(dev, out, &elapsed_ms);
+        break;
+    case CMD_SET_NOISE_BLANKER:
+        snprintf(out, sizeof(out), "NB0%u;", cmd->value ? 1 : 0);
+        err = cat_send(dev, out, &elapsed_ms);
+        break;
+    case CMD_SET_NOISE_BLANKER_LEVEL:
+        if (cmd->value == 0) {
+            snprintf(out, sizeof(out), "NB00;");
+            err = cat_send(dev, out, &elapsed_ms);
+        } else {
+            uint8_t level = cmd->value > NB_LEVEL_MAX ? NB_LEVEL_MAX : cmd->value;
+            snprintf(out, sizeof(out), "NL0%02u;", level);
+            err = cat_send(dev, out, &elapsed_ms);
+            if (err == ESP_OK) {
+                vTaskDelay(pdMS_TO_TICKS(20));
+                err = cat_send(dev, "NB01;", &elapsed_ms);
+            }
+        }
+        break;
+    case CMD_SET_NOTCH:
+        if (cmd->value == 0) {
+            snprintf(out, sizeof(out), "BC00;");
+            err = cat_send(dev, out, &elapsed_ms);
+        } else {
+            uint8_t value = cmd->value > NOTCH_VALUE_MAX ? NOTCH_VALUE_MAX : cmd->value;
+            snprintf(out, sizeof(out), "BP0%02u;", value);
+            err = cat_send(dev, out, &elapsed_ms);
+            if (err == ESP_OK) {
+                vTaskDelay(pdMS_TO_TICKS(20));
+                err = cat_send(dev, "BC01;", &elapsed_ms);
+            }
+        }
+        break;
+    case CMD_SET_MIC_GAIN:
+        if (cmd->value > MIC_GAIN_MAX) cmd->value = MIC_GAIN_MAX;
+        snprintf(out, sizeof(out), "MG%03u;", cmd->value);
         err = cat_send(dev, out, &elapsed_ms);
         break;
     default:
@@ -2673,17 +3863,21 @@ static void wifi_manager_task(void *arg)
     }
 }
 
-static void poll_one(cdc_acm_dev_hdl_t dev, const char *cmd, char *resp, size_t resp_size)
+static bool poll_one(cdc_acm_dev_hdl_t dev, const char *cmd, char *resp, size_t resp_size)
 {
     int64_t elapsed = 0;
     esp_err_t err = cat_query(dev, cmd, resp, resp_size, &elapsed);
     s_state.last_cat_ms = (uint32_t)elapsed;
     if (err != ESP_OK) {
         s_state.fail_count++;
-        ESP_LOGW(TAG, "CAT query %s failed: %s resp='%s'", cmd, esp_err_to_name(err), resp);
-        return;
+        if ((s_state.fail_count % 20) == 1) {
+            ESP_LOGW(TAG, "CAT query %s failed: %s resp='%s' fail_count=%u", cmd, esp_err_to_name(err), resp,
+                     s_state.fail_count);
+        }
+        return false;
     }
     s_state.ok_count++;
+    s_state.online = true;
     uint32_t hz = 0;
     uint8_t v = 0;
     bool b = false;
@@ -2696,7 +3890,13 @@ static void poll_one(cdc_acm_dev_hdl_t dev, const char *cmd, char *resp, size_t 
     else if (parse_bool_4(resp, "NR0", &b)) s_state.dnr_on = b;
     else if (parse_u8_3(resp, "RL0", &v)) s_state.dnr_level = v;
     else if (parse_width_index(resp, &v)) s_state.width_index = v > WIDTH_INDEX_MAX ? WIDTH_INDEX_MAX : v;
+    else if (parse_bool_4(resp, "NB0", &b)) s_state.noise_blanker_on = b;
+    else if (parse_u8_3(resp, "NL0", &v)) s_state.noise_blanker_level = v > NB_LEVEL_MAX ? NB_LEVEL_MAX : v;
+    else if (parse_bool_4(resp, "BC0", &b)) s_state.notch_on = b;
+    else if (parse_u8_3(resp, "BP0", &v)) s_state.notch_value = v > NOTCH_VALUE_MAX ? NOTCH_VALUE_MAX : v;
+    else if (parse_u8_3(resp, "MG", &v)) s_state.mic_gain = v > MIC_GAIN_MAX ? MIC_GAIN_MAX : v;
     else if (resp[0] == 'V' && resp[1] == 'S' && resp[3] == ';') s_state.active_vfo = resp[2] == '1' ? 'B' : 'A';
+    return true;
 }
 
 static void cat_task(void *arg)
@@ -2741,25 +3941,50 @@ static void cat_task(void *arg)
     ESP_LOGI(TAG, "CH9102 opened, FT-710 control UI running");
 
     char resp[64] = {};
-    const char *slow_polls[] = {"ID;", "MD0;", "MD1;", "PC;", "NR0;", "RL0;", "SH0;", "VS;"};
+    const char *slow_polls[] = {"ID;",  "MD0;", "MD1;", "PC;",  "NR0;", "RL0;", "SH0;",
+                                "VS;",  "NB0;", "NL0;", "BC0;", "BP0;", "MG;"};
     size_t slow_idx = 0;
     uint32_t loop_count = 0;
+    uint8_t consecutive_fail = 0;
+    TickType_t next_offline_probe = 0;
+    TickType_t next_ui_refresh = 0;
     while (true) {
         app_cmd_t cmd = {};
         while (xQueueReceive(s_cmd_queue, &cmd, 0) == pdTRUE) {
             apply_command(dev, &cmd);
         }
+
         memset(resp, 0, sizeof(resp));
-        poll_one(dev, "FA;", resp, sizeof(resp));
-        memset(resp, 0, sizeof(resp));
-        poll_one(dev, "FB;", resp, sizeof(resp));
-        if ((loop_count % 3) == 0) {
+        if (consecutive_fail >= CAT_OFFLINE_FAIL_LIMIT) {
+            s_state.online = false;
+            const TickType_t now = xTaskGetTickCount();
+            if (now >= next_offline_probe) {
+                if (poll_one(dev, "FA;", resp, sizeof(resp))) {
+                    consecutive_fail = 0;
+                    ESP_LOGI(TAG, "CAT polling restored");
+                } else {
+                    next_offline_probe = now + pdMS_TO_TICKS(CAT_OFFLINE_PROBE_MS);
+                }
+            }
+        } else if (poll_one(dev, "FA;", resp, sizeof(resp))) {
+            consecutive_fail = 0;
             memset(resp, 0, sizeof(resp));
-            poll_one(dev, slow_polls[slow_idx], resp, sizeof(resp));
-            slow_idx = (slow_idx + 1) % (sizeof(slow_polls) / sizeof(slow_polls[0]));
+            (void)poll_one(dev, "FB;", resp, sizeof(resp));
+            if ((loop_count % 3) == 0) {
+                memset(resp, 0, sizeof(resp));
+                (void)poll_one(dev, slow_polls[slow_idx], resp, sizeof(resp));
+                slow_idx = (slow_idx + 1) % (sizeof(slow_polls) / sizeof(slow_polls[0]));
+            }
+        } else {
+            consecutive_fail++;
         }
+
         loop_count++;
-        update_ui();
+        const TickType_t now = xTaskGetTickCount();
+        if (now >= next_ui_refresh) {
+            update_ui();
+            next_ui_refresh = now + pdMS_TO_TICKS(500);
+        }
         vTaskDelay(pdMS_TO_TICKS(70));
     }
 }

@@ -23,7 +23,10 @@
 - WiFi 设置页面
 - 联网后本地时间 / UTC 时间显示与触摸切换
 - 外接 EC11 旋钮控制频率、功率、DNR、WIDTH
-- 多个 0.96 寸 SSD1306 OLED 辅助显示功率、DNR、WIDTH 等状态
+- 5 个 0.96 寸 SSD1306 OLED 辅助显示频率、功率、DNR、WIDTH 等状态
+- 5 组“旋钮 + OLED”的硬件槽位与功能绑定抽象
+- 通过右上角现有 `MENU` 字样进入配置页，配置 5 组外接旋钮/OLED 和主屏右侧 4 个功能区域
+- 当前可配置功能包含 RF Power、DNR Level、WIDTH、Band、Mode、Noise Blanker、Notch、Mic Gain
 
 当前版本刻意不实现 PTT 和自动发射控制。后续扫频/SWR 测量功能会单独加入安全限制。
 
@@ -69,18 +72,33 @@ TCA9548A：
 
 - 默认地址：`0x70`
 - SSD1306 OLED 地址：`0x3C`
-- 通道 2：WIDTH OLED
-- 通道 3：RF Power OLED
-- 通道 4：DNR OLED
+- OLED 屏 1：TCA9548A 通道 3
+- OLED 屏 2：TCA9548A 通道 2
+- OLED 屏 3：TCA9548A 通道 4
+- OLED 屏 4：TCA9548A 通道 5
+- OLED 屏 5：TCA9548A 通道 6
 
 当前 EC11 旋钮定义：
 
-- 频率旋钮：A -> PA0，B -> PA1，按键/S -> PA2
-- 功率旋钮：A -> PA6，B -> PA7，按键/S -> PB0
-- DNR 旋钮：A -> PA3，B -> PA4，按键/S -> PA5
-- WIDTH 旋钮：A -> PB7，B -> PB6，按键/S -> PB5
+- 旋钮 1：A -> PA0，B -> PA1，按键/S -> PA2
+- 旋钮 2：A -> PA3，B -> PA4，按键/S -> PA5
+- 旋钮 3：A -> PA6，B -> PA7，按键/S -> PB1
+- 旋钮 4：A -> PB7，B -> PB6，按键/S -> PB5
+- 旋钮 5：A -> PB4，B -> PB3，按键/S -> PB2
 
-已规划后续扩展为 5 组“旋钮 + OLED”模块，每组功能可通过主控配置界面选择。
+当前 5 组“旋钮 + OLED”模块定义：
+
+- 组 1：旋钮 1 + OLED 屏 1，当前用于频率输入/显示
+- 组 2：旋钮 2 + OLED 屏 2，当前用于 DNR
+- 组 3：旋钮 3 + OLED 屏 3，当前用于 RF Power
+- 组 4：旋钮 4 + OLED 屏 4，当前用于 WIDTH
+- 组 5：旋钮 5 + OLED 屏 5，当前预留给后续可配置功能槽位；现阶段旋转时 OLED 数字递增/递减，按键清零，用于验证硬件输入和显示
+
+后续目标是每组功能都可通过主控配置界面选择。
+
+当前固件已经用 `control_slot_t` 表描述这 5 组硬件。每个槽位包含 MCP23017 A/B/S 引脚、对应 OLED 指针，以及频率、DNR、RF Power、WIDTH、预留测试等功能枚举。这是后续主控配置界面的第一步。
+
+固件还新增了 `s_feature_catalog[]` 功能目录雏形，用于登记后续计划功能的 CAT 命令、显示名称、读写能力、推荐 UI 形式、是否需要确认、是否已经实现。当前 `MENU` 配置页已经按这个方向接入，可配置 5 组外接旋钮/OLED 和主屏右侧 4 个功能面板。第一批可配置功能为 RF Power、DNR Level、WIDTH、Band、Mode、Noise Blanker、Notch、Mic Gain。
 
 ## 软件环境
 
@@ -166,12 +184,17 @@ idf.py -B build_v555 -p COM4 monitor
 - 主控制界面已在 1024 x 600 横屏上运行
 - 功率、DNR、WIDTH 支持触摸控制和旋钮控制
 - 功率与 DNR 控制已改为先本地即时反馈，再由 CAT 读回修正
+- 主屏右侧四个功能区现在可通过右上角现有 `MENU` 字样进入配置页重新分配，5 组外接旋钮/OLED 也可在同一页面重新分配
 - 模式按钮已修正为跟随当前选择的 A/B 输入目标
 - MCP23017 + EC11 旋钮在地址 `0x27` 下可稳定工作
-- OLED 经 TCA9548A 通道 2/3/4 可正常显示 WIDTH、功率、DNR
+- OLED 经 TCA9548A 通道 `3/2/4/5/6` 对应 1-5 号屏，当前程序已按 5 组槽位进行初始化
 - WIDTH OLED 已按 FT-710 `SH` 表将 0-23 索引映射为实际带宽，例如 `400`、`800`、`3500`，默认显示 `DEF`
 - WiFi 页面可启动 ESP-Hosted WiFi、扫描 2.4 GHz AP，并显示可滚动热点列表
 - 软键盘已修正 `CLEAR`、`BACK`、`SPACE` 等控制键行为
+
+待实机继续确认：
+
+- 新增 Noise Blanker `NB/NL`、Notch `BC/BP`、Mic Gain `MG` 的完整 FT-710 响应和读回同步
 
 ## WiFi 说明
 

@@ -17,10 +17,13 @@ The project builds a 7-inch landscape touch panel for controlling common FT-710 
 - Mode selection
 - Band default-frequency write
 - RF Power control
-- RF Power value mirrored to a 0.96-inch SSD1306 auxiliary OLED through TCA9548A channel 3
+- VFO / RF Power / DNR / WIDTH values mirrored to 0.96-inch SSD1306 auxiliary OLEDs through TCA9548A
 - DNR on/off and level control
 - External EC11 encoder inputs for frequency, RF Power, DNR, and WIDTH through MCP23017 over I2C
-- Three auxiliary SSD1306 OLED displays for WIDTH, RF Power, and DNR through TCA9548A
+- Five configurable auxiliary SSD1306 OLED display slots through TCA9548A
+- Slot-based hardware/function binding for the five external knob + OLED groups
+- Touch `MENU` configuration page for assigning functions to the five external knob/OLED groups and the four right-side main-screen function panels
+- Configurable function set currently includes RF Power, DNR Level, WIDTH, Band, Mode, Noise Blanker, Notch, and Mic Gain
 - CAT / BT / WiFi / RX status bar
 - WiFi setup page
 - Network time display with local / UTC toggle
@@ -38,16 +41,29 @@ The first version intentionally does not implement PTT or transmit control.
 - Optional input: EC11 rotary encoders with buttons -> Waveshare MCP23017 I/O expander -> ESP32-P4 I2C
 - Auxiliary displays: 0.96-inch 128 x 64 SSD1306 I2C OLEDs through a Qwiic Mux Breakout TCA9548A
 
-The current EC11 wiring is:
+The current five EC11 wiring baseline is:
 
-- Frequency encoder: A -> MCP23017 PA0, B -> PA1, S/button -> PA2
-- RF Power encoder: A -> PA6, B -> PA7, S/button -> PB0
-- DNR encoder: A -> PA3, B -> PA4, S/button -> PA5
-- WIDTH encoder: A -> PB7, B -> PB6, S/button -> PB5
+- Knob 1: A -> MCP23017 PA0, B -> PA1, S/button -> PA2
+- Knob 2: A -> PA3, B -> PA4, S/button -> PA5
+- Knob 3: A -> PA6, B -> PA7, S/button -> PB1
+- Knob 4: A -> PB7, B -> PB6, S/button -> PB5
+- Knob 5: A -> PB4, B -> PB3, S/button -> PB2
 
 The firmware enables MCP23017 pull-ups on those inputs, uses 100 kHz I2C for the auxiliary I2C devices, prioritizes the tested MCP23017 address `0x27`, and only accepts an address after the MCP23017 registers can be configured successfully.
 
-The current OLED/Mux wiring is: ESP32-P4 I2C1 `SDA=GPIO7`, `SCL=GPIO8`; TCA9548A default address `0x70`; SSD1306 OLED address `0x3C`. Channel 2 is WIDTH, channel 3 is RF Power, and channel 4 is DNR.
+The current OLED/Mux wiring is: ESP32-P4 I2C1 `SDA=GPIO7`, `SCL=GPIO8`; TCA9548A default address `0x70`; SSD1306 OLED address `0x3C`. OLED 1 is on channel 3, OLED 2 is on channel 2, OLED 3 is on channel 4, OLED 4 is on channel 5, and OLED 5 is on channel 6.
+
+The current hardware groups are:
+
+- Group 1: Knob 1 + OLED 1, currently used for frequency input/display
+- Group 2: Knob 2 + OLED 2, currently used for DNR
+- Group 3: Knob 3 + OLED 3, currently used for RF Power
+- Group 4: Knob 4 + OLED 4, currently used for WIDTH
+- Group 5: Knob 5 + OLED 5, reserved for the upcoming configurable function slot. For hardware validation, rotation increments/decrements a visible OLED counter and the button resets it to zero.
+
+The firmware now describes those groups with a `control_slot_t` table. Each slot owns its MCP23017 A/B/button pins, an OLED pointer, and a function enum such as frequency, DNR, RF Power, WIDTH, or slot test. This is the first step toward the planned on-device configuration UI.
+
+The firmware also includes an initial `s_feature_catalog[]` registry for planned functions. It records the CAT command, display label, read/write access, recommended UI surfaces, confirmation needs, and implementation status. The current `MENU` page uses that direction to configure the five external knob/OLED slots and the four main-screen function panels. The first configurable set contains RF Power, DNR Level, WIDTH, Band, Mode, Noise Blanker, Notch, and Mic Gain.
 
 The FT-710 rear USB direct CP2105 route was tested, but ESP-IDF v5.5.5 currently cannot enumerate the FT-710 downstream CP2105 through the radio's USB hub because the required Hub TT path is not supported for this use case. The first working route is therefore the external CH9102 USB-TTL adapter connected to the FT-710 CAT-3 port.
 
@@ -133,9 +149,10 @@ Development and hardware tests have confirmed:
 - Dual VFO frequency polling around 100 ms is usable.
 - Main control UI runs on the 1024 x 600 touch screen.
 - RF Power and DNR now use immediate local UI update plus CAT write and later readback correction.
+- The right-side main-screen panels are now configurable from the existing top-right `MENU` label. The same page can also reassign the five external knob/OLED groups.
 - MCP23017 + EC11 external encoders are detected over I2C at the verified `0x27` address. The frequency encoder adjusts the selected VFO input in 1 kHz steps and sends it on button press; the RF Power encoder is globally available and supports selectable `2W/5W/10W` steps from its push button; the DNR encoder adjusts DNR and its button turns DNR off; the WIDTH encoder adjusts `SH00xx;` and its button sends the WIDTH default.
 - Standalone OLED/Mux/encoder test works: TCA9548A detected at `0x70`, OLED detected at `0x3C` behind channel 3, MCP23017 detected at `0x27`, and rotating the RF Power encoder updates the 0.96-inch OLED power display in 1W steps.
-- Main firmware integration of the auxiliary OLEDs works at startup: `Aux OLED ready: TCA9548A=0x70 channel=2/3/4 SSD1306=0x3C`. The OLEDs follow the main state from a background task, so touch changes, encoder changes, and CAT readback corrections can update the small displays without blocking UI refresh.
+- Main firmware integration of the auxiliary OLEDs works from a background task, so touch changes, encoder changes, and CAT readback corrections can update the small displays without blocking UI refresh. The latest hardware baseline uses five OLED slots on TCA9548A channels `3/2/4/5/6`.
 - Main firmware RF Power encoder verification after the OLED integration fix: `Power encoder set 14W..18W` and CAT `PC014..PC018` all returned `ESP_OK`.
 - Mode buttons now follow the selected A/B input target, so VFO-A sends `MD0x;` and VFO-B sends `MD1x;`.
 - WIDTH display now maps the FT-710 `SH` index to actual bandwidth values. `00` is shown as `DEF`; valid mode-specific values show Hz numbers such as `400`, `800`, or `3500`; invalid mode/index combinations show `---`.
@@ -143,6 +160,7 @@ Development and hardware tests have confirmed:
 - RF Power OLED rendering now uses a smaller upper power readout plus a bottom `5-100W` progress bar. DNR and RF Power OLEDs no longer show the old lower-left `FT-710` label.
 - WiFi setup page starts ESP-Hosted WiFi, scans 2.4 GHz APs, and presents a scrollable AP list.
 - Soft keyboard control keys were fixed: `CLEAR`, `BACK`, and `SPACE` now behave correctly.
+- CAT support has been extended in the configurable framework for Noise Blanker (`NB/NL`), Notch (`BC/BP`), and Mic Gain (`MG`). These are ready for FT-710 hardware verification.
 
 ## WiFi Notes
 

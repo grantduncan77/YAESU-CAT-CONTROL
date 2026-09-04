@@ -27,6 +27,11 @@ typedef struct {
     bool dnr_on;
     uint8_t dnr_level;
     uint8_t width_index;
+    bool noise_blanker_on;
+    uint8_t noise_blanker_level;
+    bool notch_on;
+    uint8_t notch_value;
+    uint8_t mic_gain;
     uint32_t ok_count;
     uint32_t fail_count;
     uint32_t last_cat_ms;

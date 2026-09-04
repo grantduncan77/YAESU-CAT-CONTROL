@@ -1,5 +1,7 @@
 # FT-710 CAT Control
 
+[中文说明](README.zh-CN.md)
+
 YAESU FT-710 external touch controller based on the Waveshare ESP32-P4-WIFI6-LCD-TOUCH-7B.
 
 This repository contains the current ESP-IDF/LVGL firmware and the hardware probe projects created while validating the CAT communication path.

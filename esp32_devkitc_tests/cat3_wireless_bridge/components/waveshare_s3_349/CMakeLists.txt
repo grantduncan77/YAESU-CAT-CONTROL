@@ -1,0 +1,20 @@
+idf_component_register(
+    SRCS
+        "lvgl_port.c"
+        "i2c_bsp.c"
+        "src/axs15231b/esp_lcd_axs15231b.c"
+        "src/touch/esp_lcd_touch.c"
+        "src/tca9554/esp_io_expander.c"
+        "src/tca9554/esp_io_expander_tca9554.c"
+        "src/lcd_bl_bsp/lcd_bl_pwm_bsp.c"
+    INCLUDE_DIRS
+        "."
+        "src/axs15231b"
+        "src/touch"
+        "src/tca9554"
+        "src/lcd_bl_bsp"
+    REQUIRES
+        driver
+        esp_lcd
+        esp_timer
+        lvgl)

@@ -30,6 +30,7 @@
 #include "lvgl.h"
 #include "lwip/inet.h"
 #include "lwip/sockets.h"
+#include "lwip/tcp.h"
 #include "nvs.h"
 #include "nvs_flash.h"
 #include "radio_state.h"
@@ -151,6 +152,7 @@ typedef struct {
 #define CAT_TX_TIMEOUT_MS 100
 #define CAT_OFFLINE_FAIL_LIMIT 4
 #define CAT_OFFLINE_PROBE_MS 700
+#define WIFI_BRIDGE_CAT_TIMEOUT_MS 900
 #define AUX_OLED_RETRY_MS 2000
 
 typedef struct {
@@ -326,6 +328,8 @@ static QueueHandle_t s_cmd_queue;
 static QueueHandle_t s_wifi_cmd_queue;
 static EventGroupHandle_t s_wifi_event_group;
 static SemaphoreHandle_t s_i2c_mutex;
+static SemaphoreHandle_t s_wifi_bridge_mutex;
+static SemaphoreHandle_t s_wifi_cat_mutex;
 static radio_state_t s_state;
 static char s_input[18];
 static char s_input_target_vfo = 'A';
@@ -350,6 +354,10 @@ static wifi_ap_item_t s_wifi_aps[WIFI_AP_MAX];
 static char s_wifi_ap_ids[WIFI_AP_MAX][6];
 static uint16_t s_wifi_ap_count;
 static bool s_wifi_bridge_task_started;
+static bool s_wifi_bridge_online;
+static char s_wifi_bridge_ip[16];
+static int s_wifi_bridge_port;
+static int s_wifi_bridge_sock = -1;
 static i2c_master_dev_handle_t s_mcp23017_dev;
 static i2c_master_dev_handle_t s_tca9548a_dev;
 static aux_oled_t s_freq_oled = {.channel = TCA9548A_FREQ_OLED_CHANNEL};
@@ -744,9 +752,208 @@ static esp_err_t read_frame(char *out, size_t out_size, TickType_t timeout)
     return ESP_ERR_TIMEOUT;
 }
 
+static bool wifi_bridge_get_endpoint(char *ip, size_t ip_size, int *port)
+{
+    if (!s_wifi_bridge_mutex || !ip || ip_size == 0 || !port) {
+        return false;
+    }
+    bool online = false;
+    if (xSemaphoreTake(s_wifi_bridge_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+        online = s_wifi_bridge_online;
+        if (online) {
+            strlcpy(ip, s_wifi_bridge_ip, ip_size);
+            *port = s_wifi_bridge_port;
+        }
+        xSemaphoreGive(s_wifi_bridge_mutex);
+    }
+    return online;
+}
+
+static bool wifi_bridge_is_online(void)
+{
+    char ip[16] = {};
+    int port = 0;
+    return wifi_bridge_get_endpoint(ip, sizeof(ip), &port);
+}
+
+static void wifi_bridge_close_socket(void);
+
+static void wifi_bridge_set_endpoint(const char *ip, int port, bool online)
+{
+    if (!s_wifi_bridge_mutex) {
+        return;
+    }
+    if (xSemaphoreTake(s_wifi_bridge_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+        s_wifi_bridge_online = online;
+        if (online && ip) {
+            strlcpy(s_wifi_bridge_ip, ip, sizeof(s_wifi_bridge_ip));
+            s_wifi_bridge_port = port;
+        } else if (!online) {
+            s_wifi_bridge_ip[0] = '\0';
+            s_wifi_bridge_port = 0;
+        }
+        xSemaphoreGive(s_wifi_bridge_mutex);
+    }
+    if (!online && s_wifi_cat_mutex && xSemaphoreTake(s_wifi_cat_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+        wifi_bridge_close_socket();
+        xSemaphoreGive(s_wifi_cat_mutex);
+    }
+}
+
+static void wifi_bridge_close_socket(void)
+{
+    if (s_wifi_bridge_sock >= 0) {
+        close(s_wifi_bridge_sock);
+        s_wifi_bridge_sock = -1;
+    }
+}
+
+static bool wifi_bridge_extract_cat_frame(const char *rx, const char *cmd, char *resp, size_t resp_size)
+{
+    const char *search = rx;
+    const char *echo = strstr(rx, "WIFI-ECHO:");
+    if (echo) {
+        const char *echo_end = strchr(echo, ';');
+        if (echo_end) {
+            search = echo_end + 1;
+        }
+    }
+
+    for (const char *p = search; p && p[0] && p[1]; ++p) {
+        if (p[0] != cmd[0] || p[1] != cmd[1]) {
+            continue;
+        }
+        const char *end = strchr(p, ';');
+        if (!end) {
+            continue;
+        }
+        const size_t frame_len = (size_t)(end - p + 1);
+        if (frame_len <= strlen(cmd)) {
+            continue;
+        }
+        if (resp && resp_size > 0) {
+            const size_t copy_len = frame_len < resp_size - 1 ? frame_len : resp_size - 1;
+            memcpy(resp, p, copy_len);
+            resp[copy_len] = '\0';
+        }
+        return true;
+    }
+    return false;
+}
+
+static esp_err_t wifi_bridge_ensure_socket_locked(const char *ip, int port)
+{
+    if (s_wifi_bridge_sock >= 0) {
+        return ESP_OK;
+    }
+
+    int sock = socket(AF_INET, SOCK_STREAM, IPPROTO_IP);
+    if (sock < 0) {
+        ESP_LOGW(TAG, "CAT WiFi socket failed: errno=%d", errno);
+        return ESP_FAIL;
+    }
+
+    int yes = 1;
+    setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &yes, sizeof(yes));
+    struct timeval timeout = {
+        .tv_sec = 0,
+        .tv_usec = 180000,
+    };
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+
+    struct sockaddr_in dest = {
+        .sin_family = AF_INET,
+        .sin_port = htons((uint16_t)port),
+        .sin_addr.s_addr = inet_addr(ip),
+    };
+    if (connect(sock, (struct sockaddr *)&dest, sizeof(dest)) != 0) {
+        ESP_LOGW(TAG, "CAT WiFi bridge connect %s:%d failed: errno=%d", ip, port, errno);
+        close(sock);
+        return ESP_FAIL;
+    }
+
+    s_wifi_bridge_sock = sock;
+    ESP_LOGI(TAG, "CAT WiFi bridge connected: %s:%d", ip, port);
+    return ESP_OK;
+}
+
+static esp_err_t wifi_bridge_exchange(const char *cmd, char *resp, size_t resp_size, bool expect_cat_response)
+{
+    char ip[16] = {};
+    int port = 0;
+    if (!wifi_bridge_get_endpoint(ip, sizeof(ip), &port)) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    if (xSemaphoreTake(s_wifi_cat_mutex, pdMS_TO_TICKS(250)) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
+
+    esp_err_t err = wifi_bridge_ensure_socket_locked(ip, port);
+    if (err != ESP_OK) {
+        wifi_bridge_close_socket();
+        wifi_bridge_set_endpoint(NULL, 0, false);
+        xSemaphoreGive(s_wifi_cat_mutex);
+        return err;
+    }
+
+    if (send(s_wifi_bridge_sock, cmd, strlen(cmd), 0) < 0) {
+        ESP_LOGW(TAG, "CAT WiFi bridge send failed: errno=%d", errno);
+        wifi_bridge_close_socket();
+        xSemaphoreGive(s_wifi_cat_mutex);
+        return ESP_FAIL;
+    }
+    if (!expect_cat_response) {
+        xSemaphoreGive(s_wifi_cat_mutex);
+        return ESP_OK;
+    }
+
+    char rx[192] = {};
+    size_t used = 0;
+    const int64_t deadline_us = esp_timer_get_time() + (WIFI_BRIDGE_CAT_TIMEOUT_MS * 1000LL);
+    while (esp_timer_get_time() < deadline_us && used + 1 < sizeof(rx)) {
+        int len = recv(s_wifi_bridge_sock, rx + used, sizeof(rx) - used - 1, 0);
+        if (len > 0) {
+            used += (size_t)len;
+            rx[used] = '\0';
+            if (!expect_cat_response) {
+                xSemaphoreGive(s_wifi_cat_mutex);
+                return ESP_OK;
+            }
+            if (wifi_bridge_extract_cat_frame(rx, cmd, resp, resp_size)) {
+                xSemaphoreGive(s_wifi_cat_mutex);
+                return ESP_OK;
+            }
+        } else if (len == 0) {
+            wifi_bridge_close_socket();
+            break;
+        } else if (errno != EAGAIN && errno != EWOULDBLOCK) {
+            ESP_LOGW(TAG, "CAT WiFi bridge recv failed: errno=%d", errno);
+            wifi_bridge_close_socket();
+            break;
+        }
+        vTaskDelay(pdMS_TO_TICKS(2));
+    }
+
+    if (resp && resp_size > 0) {
+        resp[0] = '\0';
+    }
+    xSemaphoreGive(s_wifi_cat_mutex);
+    return ESP_ERR_TIMEOUT;
+}
+
 static esp_err_t cat_query(cdc_acm_dev_hdl_t dev, const char *cmd, char *resp, size_t resp_size, int64_t *elapsed_ms)
 {
     const int64_t start_us = esp_timer_get_time();
+    if (wifi_bridge_is_online()) {
+        const esp_err_t err = wifi_bridge_exchange(cmd, resp, resp_size, true);
+        if (elapsed_ms) {
+            *elapsed_ms = (esp_timer_get_time() - start_us) / 1000;
+        }
+        return err;
+    }
+    ESP_RETURN_ON_FALSE(dev != NULL, ESP_ERR_INVALID_STATE, TAG, "no CAT transport");
     flush_rx();
     ESP_RETURN_ON_ERROR(cdc_acm_host_data_tx_blocking(dev, (const uint8_t *)cmd, strlen(cmd), CAT_TX_TIMEOUT_MS), TAG,
                         "tx failed");
@@ -760,6 +967,14 @@ static esp_err_t cat_query(cdc_acm_dev_hdl_t dev, const char *cmd, char *resp, s
 static esp_err_t cat_send(cdc_acm_dev_hdl_t dev, const char *cmd, int64_t *elapsed_ms)
 {
     const int64_t start_us = esp_timer_get_time();
+    if (wifi_bridge_is_online()) {
+        const esp_err_t err = wifi_bridge_exchange(cmd, NULL, 0, false);
+        if (elapsed_ms) {
+            *elapsed_ms = (esp_timer_get_time() - start_us) / 1000;
+        }
+        return err;
+    }
+    ESP_RETURN_ON_FALSE(dev != NULL, ESP_ERR_INVALID_STATE, TAG, "no CAT transport");
     flush_rx();
     const esp_err_t err = cdc_acm_host_data_tx_blocking(dev, (const uint8_t *)cmd, strlen(cmd), CAT_TX_TIMEOUT_MS);
     if (elapsed_ms) {
@@ -3668,9 +3883,19 @@ static void wifi_bridge_client_task(void *arg)
         if (!parse_bridge_discovery(msg, bridge_ip, sizeof(bridge_ip), &bridge_port)) {
             continue;
         }
+        char current_ip[16] = {};
+        int current_port = 0;
+        if (wifi_bridge_get_endpoint(current_ip, sizeof(current_ip), &current_port) &&
+            strcmp(current_ip, bridge_ip) == 0 && current_port == bridge_port) {
+            vTaskDelay(pdMS_TO_TICKS(5000));
+            continue;
+        }
         ESP_LOGI(TAG, "WiFi bridge found: %s:%d", bridge_ip, bridge_port);
         if (wifi_bridge_tcp_probe(bridge_ip, bridge_port) == ESP_OK) {
+            wifi_bridge_set_endpoint(bridge_ip, bridge_port, true);
             vTaskDelay(pdMS_TO_TICKS(5000));
+        } else {
+            wifi_bridge_set_endpoint(NULL, 0, false);
         }
     }
 }
@@ -3878,6 +4103,10 @@ static bool poll_one(cdc_acm_dev_hdl_t dev, const char *cmd, char *resp, size_t 
     }
     s_state.ok_count++;
     s_state.online = true;
+    if (s_state.ok_count <= 20 || (s_state.ok_count % 80) == 0) {
+        ESP_LOGI(TAG, "CAT query %s OK resp='%s' elapsed=%lldms ok_count=%u", cmd, resp, elapsed,
+                 s_state.ok_count);
+    }
     uint32_t hz = 0;
     uint8_t v = 0;
     bool b = false;
@@ -3899,60 +4128,43 @@ static bool poll_one(cdc_acm_dev_hdl_t dev, const char *cmd, char *resp, size_t 
     return true;
 }
 
+static uint8_t process_pending_commands(cdc_acm_dev_hdl_t dev)
+{
+    uint8_t handled = 0;
+    app_cmd_t cmd = {};
+    while (xQueueReceive(s_cmd_queue, &cmd, 0) == pdTRUE) {
+        apply_command(dev, &cmd);
+        handled++;
+    }
+    return handled;
+}
+
 static void cat_task(void *arg)
 {
     (void)arg;
-    const usb_host_config_t host_config = {
-        .skip_phy_setup = false,
-        .root_port_unpowered = false,
-        .intr_flags = ESP_INTR_FLAG_LEVEL1,
-    };
-    ESP_ERROR_CHECK(usb_host_install(&host_config));
-    BaseType_t task_created = xTaskCreate(usb_lib_task, "usb_lib", 4096, NULL, 10, NULL);
-    assert(task_created == pdTRUE);
-    ESP_ERROR_CHECK(cdc_acm_host_install(NULL));
-
-    const cdc_acm_host_device_config_t dev_config = {
-        .connection_timeout_ms = 20000,
-        .out_buffer_size = 512,
-        .in_buffer_size = 512,
-        .event_cb = event_cb,
-        .data_cb = rx_cb,
-        .user_arg = NULL,
-    };
-
     cdc_acm_dev_hdl_t dev = NULL;
-    ESP_LOGI(TAG, "Waiting for CH9102 1A86:55D4");
-    esp_err_t err = cdc_acm_host_open(0x1A86, 0x55D4, 0, &dev_config, &dev);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to open CH9102: %s", esp_err_to_name(err));
-        vTaskDelete(NULL);
-    }
-
-    const cdc_acm_line_coding_t line_coding = {
-        .dwDTERate = 38400,
-        .bCharFormat = 0,
-        .bParityType = 0,
-        .bDataBits = 8,
-    };
-    ESP_ERROR_CHECK(cdc_acm_host_line_coding_set(dev, &line_coding));
-    ESP_ERROR_CHECK(cdc_acm_host_set_control_line_state(dev, false, false));
-    s_state.online = true;
-    ESP_LOGI(TAG, "CH9102 opened, FT-710 control UI running");
+    ESP_LOGI(TAG, "CAT task running; waiting for WiFi Bridge transport");
 
     char resp[64] = {};
-    const char *slow_polls[] = {"ID;",  "MD0;", "MD1;", "PC;",  "NR0;", "RL0;", "SH0;",
-                                "VS;",  "NB0;", "NL0;", "BC0;", "BP0;", "MG;"};
+    const char *slow_polls[] = {"ID;", "MD0;", "MD1;", "PC;", "NR0;", "RL0;", "SH0;", "VS;"};
     size_t slow_idx = 0;
     uint32_t loop_count = 0;
     uint8_t consecutive_fail = 0;
     TickType_t next_offline_probe = 0;
     TickType_t next_ui_refresh = 0;
     while (true) {
-        app_cmd_t cmd = {};
-        while (xQueueReceive(s_cmd_queue, &cmd, 0) == pdTRUE) {
-            apply_command(dev, &cmd);
+        if (!wifi_bridge_is_online() && dev == NULL) {
+            s_state.online = false;
+            const TickType_t now = xTaskGetTickCount();
+            if (now >= next_ui_refresh) {
+                update_ui();
+                next_ui_refresh = now + pdMS_TO_TICKS(500);
+            }
+            vTaskDelay(pdMS_TO_TICKS(200));
+            continue;
         }
+
+        uint8_t handled_commands = process_pending_commands(dev);
 
         memset(resp, 0, sizeof(resp));
         if (consecutive_fail >= CAT_OFFLINE_FAIL_LIMIT) {
@@ -3966,17 +4178,31 @@ static void cat_task(void *arg)
                     next_offline_probe = now + pdMS_TO_TICKS(CAT_OFFLINE_PROBE_MS);
                 }
             }
-        } else if (poll_one(dev, "FA;", resp, sizeof(resp))) {
+        } else if (handled_commands > 0) {
             consecutive_fail = 0;
-            memset(resp, 0, sizeof(resp));
-            (void)poll_one(dev, "FB;", resp, sizeof(resp));
-            if ((loop_count % 3) == 0) {
+        } else {
+            const bool active_is_b = s_state.active_vfo == 'B';
+            const char *active_freq_cmd = active_is_b ? "FB;" : "FA;";
+            const char *idle_freq_cmd = active_is_b ? "FA;" : "FB;";
+            if (!poll_one(dev, active_freq_cmd, resp, sizeof(resp))) {
+                consecutive_fail++;
+                loop_count++;
+                vTaskDelay(pdMS_TO_TICKS(35));
+                continue;
+            }
+            consecutive_fail = 0;
+            (void)process_pending_commands(dev);
+            if ((loop_count % 2) == 0) {
+                memset(resp, 0, sizeof(resp));
+                (void)poll_one(dev, idle_freq_cmd, resp, sizeof(resp));
+                (void)process_pending_commands(dev);
+            }
+            if ((loop_count % 8) == 0) {
                 memset(resp, 0, sizeof(resp));
                 (void)poll_one(dev, slow_polls[slow_idx], resp, sizeof(resp));
                 slow_idx = (slow_idx + 1) % (sizeof(slow_polls) / sizeof(slow_polls[0]));
+                (void)process_pending_commands(dev);
             }
-        } else {
-            consecutive_fail++;
         }
 
         loop_count++;
@@ -3985,7 +4211,7 @@ static void cat_task(void *arg)
             update_ui();
             next_ui_refresh = now + pdMS_TO_TICKS(500);
         }
-        vTaskDelay(pdMS_TO_TICKS(70));
+        vTaskDelay(pdMS_TO_TICKS(35));
     }
 }
 
@@ -3998,7 +4224,9 @@ void app_controller_start(void)
     s_cmd_queue = xQueueCreate(16, sizeof(app_cmd_t));
     s_wifi_cmd_queue = xQueueCreate(8, sizeof(wifi_cmd_t));
     s_i2c_mutex = xSemaphoreCreateMutex();
-    assert(s_rx_queue && s_cmd_queue && s_wifi_cmd_queue && s_i2c_mutex);
+    s_wifi_bridge_mutex = xSemaphoreCreateMutex();
+    s_wifi_cat_mutex = xSemaphoreCreateMutex();
+    assert(s_rx_queue && s_cmd_queue && s_wifi_cmd_queue && s_i2c_mutex && s_wifi_bridge_mutex && s_wifi_cat_mutex);
 
     bsp_display_cfg_t cfg = {
         .lv_adapter_cfg = ESP_LV_ADAPTER_DEFAULT_CONFIG(),

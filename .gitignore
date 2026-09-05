@@ -28,3 +28,4 @@ Desktop.ini
 *.bin
 *.elf
 *.map
+sdkconfig.old
